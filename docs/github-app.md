@@ -45,6 +45,13 @@ these are the events to subscribe to:
 
 ## Credentials at runtime
 
+> **Two auth paths coexist.** This page documents the **maintainer /
+> CI** path (GitHub App PEM → installation token). End-users hit the
+> separate **auth-worker device flow** described in
+> [`docs/credentials.md`](./credentials.md) (and in
+> [ADR-002](../ARCHITECTURE.md#adr-002-end-user-auth-via-auth-worker-mcp-oauth-provider)).
+> Do not distribute the PEM to end-users; they don't need it.
+
 The agent binary reads three environment variables:
 
 | Env var                        | Value                                                    |
