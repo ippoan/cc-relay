@@ -1,0 +1,28 @@
+[package]
+name = "agent-broker"
+description = "cc-relay Broker trait + GitHubBroker impl (cross-sandbox state via GitHub Issues)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+# Reqwest / tokio are reserved for the GitHubBroker impl that lands in P4b.
+# Pulled in now so `Broker` impls in this crate don't need to add them later
+# and so `cargo build -p agent-broker` exercises the same feature set.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "macros", "fs", "time", "sync"] }
