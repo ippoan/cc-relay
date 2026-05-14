@@ -12,4 +12,33 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-# Filled in by P2 (#5).
+agent-core = { path = "../agent-core", features = ["io"] }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "net",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# notify v6 + the matching debouncer. The `full` variant carries the
+# `notify-debouncer-mini` improvements that coalesce rename/create pairs.
+notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+notify-debouncer-full = { version = "0.3", default-features = false }
+ignore = "0.4"
+
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
