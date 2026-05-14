@@ -27,3 +27,7 @@ coverage/
 
 # Local Claude state (settings.local.json carries machine-specific allow-lists)
 .claude/settings.local.json
+
+# Secrets — never commit private keys (see docs/github-app.md)
+*.pem
+*.key

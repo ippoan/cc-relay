@@ -1,0 +1,31 @@
+name: auto-merge
+
+# Once a PR is open and not a draft, ask GitHub to merge it as soon as the
+# branch protection requirements on the target branch are satisfied. The
+# actual merge gate is the branch protection rule, not this workflow — this
+# workflow just flips the "auto-merge" flag on the PR via the gh CLI.
+#
+# Prerequisites (configured once, in the repo's Settings):
+#   - General → "Allow auto-merge" is ON
+#   - Branches → Branch protection for `main` requires the rust (fmt/clippy/test)
+#     checks. Without that, auto-merge would merge instantly with no gating,
+#     which is not the intent.
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, reopened, synchronize]
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  enable-auto-merge:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
