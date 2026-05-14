@@ -171,3 +171,30 @@ not for arbitrary outbound from the user's process.
 | **P6**  | #18   | `agent-cli` simplification (`stdio` only, `--broker` flag)   |
 | **P7**  | #19   | end-to-end integration test against a real GitHub repo       |
 | **P8**  | #20   | README rewrite + `.mcp.json` template                        |
+
+### Validation (2026-05-14)
+
+A throwaway `.mcp.json` probe (added in 585f85c, removed in the next commit)
+confirmed end-to-end on Claude Code on Web that:
+
+- Repo-local `.mcp.json` is read at session start, after the branch is
+  checked out.
+- `type: "stdio"` entries are honored; the configured `command` is spawned
+  with `args` from the repo root.
+- The server's `tools/list` results are registered as
+  `mcp__<server>__<tool>` in the session's tool namespace.
+- The full `initialize` / `notifications/initialized` / `tools/list` /
+  `tools/call` round-trip over stdio JSON-RPC completes successfully.
+
+Two additional observations from the probe that constrain the design:
+
+- The filesystem is **not** shared across sessions — each session runs in
+  its own container with a distinct `CLAUDE_CODE_CONTAINER_ID`. No
+  filesystem-based broker is viable; the GitHub Issue broker assumption in
+  the decision above stands.
+- `.mcp.json` is read at session start only. Editing it (or the binary it
+  points to) mid-session has no effect until the next session starts. The
+  `SessionStart` hook (versioned under `hooks/` per #9) is the right place
+  to ensure the agent binary exists before Claude Code reads `.mcp.json` —
+  i.e. download a pinned release artifact, or `cargo install` from a tag,
+  whichever phase #20 lands on.
