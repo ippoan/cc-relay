@@ -1,0 +1,19 @@
+[package]
+name = "agent-cli"
+description = "rust-mcp-agent binary: clap dispatcher for the daemon and stdio MCP subcommands."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rust-mcp-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Filled in by P2 (#5, #6). For P0 the binary is just a stub.

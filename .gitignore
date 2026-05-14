@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Node / coordinator
+node_modules/
+.wrangler/
+dist/
+.dev.vars
+.dev.vars.*
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Generated coverage / profiling
+coverage/
+*.profraw
+*.profdata
+
+# Local Claude state (settings.local.json carries machine-specific allow-lists)
+.claude/settings.local.json

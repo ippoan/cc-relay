@@ -1,0 +1,20 @@
+[package]
+name = "agent-core"
+description = "Wire protocol types for cc-relay (Rust source of truth, ts-rs exports TypeScript)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables blocking/async I/O helpers for /tmp/agent-inbox.jsonl. Implemented in P1.
+io = []
+
+[dependencies]
+# Filled in by P1 (#4).

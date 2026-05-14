@@ -1,0 +1,15 @@
+[package]
+name = "agent-mcp"
+description = "cc-relay stdio MCP server that relays tool calls to the local daemon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Filled in by P2 (#6).

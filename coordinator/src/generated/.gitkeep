@@ -1,0 +1,4 @@
+# This directory holds TypeScript types auto-generated from
+# `crates/agent-core` via ts-rs. Populated in P1 (#4); kept empty in P0 so the
+# CI `git diff --exit-code coordinator/src/generated/` step has a stable
+# baseline before the export runs.

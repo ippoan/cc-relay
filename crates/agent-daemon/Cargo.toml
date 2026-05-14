@@ -1,0 +1,15 @@
+[package]
+name = "agent-daemon"
+description = "cc-relay daemon: file watcher, WebSocket client, and local HTTP server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Filled in by P2 (#5).
