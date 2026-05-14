@@ -31,7 +31,15 @@ jobs:
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain
 
+      # fmt は cargo build しないので cache 不要。
+      # clippy / test は別 artifact なので shared-key を matrix kind で分けて save 衝突
+      # ("Unable to reserve cache with key ..., another job may be creating this cache.")
+      # を避ける。save は main の push 時のみに絞り、PR は main の cache を restore する。
       - uses: Swatinem/rust-cache@v2
+        if: matrix.kind != 'fmt'
+        with:
+          shared-key: rust-${{ matrix.kind }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo fmt --check
         if: matrix.kind == 'fmt'
