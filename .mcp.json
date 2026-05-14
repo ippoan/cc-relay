@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cc-relay": {
+      "type": "http",
+      "url": "https://mcp-staging.ippoan.org/mcp"
+    }
+  }
+}
