@@ -317,3 +317,151 @@ workaround.
 - Sandbox reachability probe (`scripts/probe-relay-reachability.sh`)
   and findings (`docs/relay-validation.md`) confirm the host-side
   mount workaround is necessary as of 2026-05-14.
+
+---
+
+## ADR-003: Sandbox auth via Claude Code MCP connector + auth-worker user-less relay
+
+**Status:** Proposed (2026-05-14). Supersedes ADR-002 (host-side mount) for
+the Claude Code on Web hot path. ADR-002 is retained as the CI / non-Claude-
+Code fallback. Issue [#35](https://github.com/ippoan/cc-relay/issues/35).
+
+### Context
+
+ADR-002 ships an end-user via `rust-mcp-agent auth` on the host laptop, then
+read-only mounts `~/.cc-relay/token` into the sandbox. This works but adds a
+2-step setup (host login + mount config) before `fresh clone → open in Claude
+Code Web` becomes useful.
+
+Investigation of `ippoan/auth-worker` (2026-05-14, `src/`) found that the MCP
+OAuth Provider already exposes a complete *MCP relay*:
+
+- `POST https://mcp(-staging).ippoan.org/u/<github_login>/mcp` — HTTP bridge
+  (Phase 7 / #119 implemented in `src/durable_objects/mcp-session-do.ts`),
+- `GET .../u/<github_login>/connect` — outbound WebSocket from a binary,
+- DCR (`/mcp/register`) + Authorization Code + PKCE on `mcp.ippoan.org`
+  (Phase 5 / #128 implemented in `src/handlers/mcp-{register,authorize,
+  auth-callback}.ts`),
+- `WWW-Authenticate: Bearer realm="MCP", resource_metadata=…` on 401 (MCP
+  Authorization spec 2025-06-18 compliant).
+
+The crucial property: **Claude Code on Web's MCP client traffic is routed
+through the Anthropic backend**, not the sandbox proxy — so `mcp.ippoan.org`
+is reachable from a session even though direct `curl` from inside the
+sandbox still gets `403 host_not_allowed` (cf. ADR-002 §Validation,
+`docs/relay-validation.md`).
+
+The remaining gap is that the existing relay endpoint is **user-scoped**
+(`/u/<github_login>/…`) — a `.mcp.json` committed to a shared repo cannot
+contain a literal login. A user-less endpoint that resolves the DO from
+the JWT's `github_login` claim closes the gap and lets the same
+`.mcp.json` work for every collaborator.
+
+### Decision
+
+1. **Auth-worker exposes a user-less MCP endpoint.** New routes on
+   `mcp(-staging).ippoan.org`:
+   - `POST /mcp` — same body / behavior as `/u/:user/mcp`, but DO id is
+     derived from `verifyMcpJwt(jwt).github_login` rather than the URL.
+   - `GET /connect` — analogous WS upgrade for the binary side.
+   Existing `/u/:user/mcp` routes are retained for `github-mcp-server-rs`
+   back-compat. Tracked in a separate auth-worker issue.
+2. **Commit `.mcp.json` at the cc-relay repo root.** Single static entry:
+   ```json
+   {
+     "mcpServers": {
+       "cc-relay": {
+         "type": "http",
+         "url": "https://mcp-staging.ippoan.org/mcp"
+       }
+     }
+   }
+   ```
+   `type: "http"` matches the Streamable HTTP bridge (POST + JSON, no SSE
+   upgrade — confirmed via `src/handlers/mcp-relay-bridge.ts` reading).
+   Production switches to `mcp.ippoan.org` after staging acceptance.
+3. **cc-relay broker becomes the MCP server itself.** Option (b) from #35
+   §3: `crates/agent-broker` (or a new `crates/agent-mcp-server`) hosts
+   an `rmcp::StreamableHttpService` + outbound WS client to
+   `wss://mcp-staging.ippoan.org/connect`. Tools exposed mirror the
+   `GitHubBroker` API (notify_agent, claim_task, plan ops) but the
+   broker no longer calls `api.github.com` from inside the sandbox —
+   the host-side broker process holds the auth-worker JWT and calls
+   GitHub directly.
+4. **First-session UX is OAuth-driven.** On `tools/list`, Claude Code Web
+   POSTs `/mcp` → 401 + `resource_metadata` → user is shown the
+   `mcp.ippoan.org/authorize` GitHub consent screen
+   (`mcp.write` → GitHub `repo` scope). Approval mints a JWT scoped to
+   the user's `github_login`. No `~/.cc-relay/token` step from the user's
+   perspective; the host-side broker stores the JWT in memory and
+   refreshes via `/mcp/token` (refresh_token grant) before expiry.
+5. **`INTERNAL_SHARED_SECRET` is no longer needed.** The broker does not
+   call `/mcp/introspect` (it already holds the JWT). ADR-002 §4
+   dependency is dropped.
+6. **ADR-002 retained as fallback.** CI runs, non-Claude-Code-Web local
+   shells, and any environment without MCP-routing-capable client
+   continue to use host-side `rust-mcp-agent auth` + token mount.
+
+### Consequences
+
+- **Sandbox auth is one user-facing click**: GitHub consent on first
+  session. No host CLI invocation, no file mount step.
+- **Broker is a long-running host process** (WS connection to
+  `mcp.ippoan.org`). Previous ADR-002 design ran the broker inside the
+  sandbox; that changes — the sandbox now only holds the Claude Code
+  agent, which reaches the broker indirectly via the Anthropic MCP
+  router → auth-worker DO → host-side broker WS.
+- **JWT lives in host broker memory only.** A refresh_token may be
+  persisted to `~/.cc-relay/refresh_token` (mode 0600) so the host
+  broker survives restarts, but the access JWT itself is never written
+  to disk.
+- **Latency:** Claude Code Web → Anthropic backend → `mcp.ippoan.org`
+  DO → WS → host broker → `api.github.com` → reverse. Two extra hops
+  vs ADR-002's direct `api.github.com` call. Acceptable for the
+  human-in-the-loop coordination this project targets.
+- **auth-worker dependency widens.** Previously auth-worker was a
+  refresh-time-only dependency (≈ 1/hour). Now every MCP tool call
+  passes through `mcp.ippoan.org`. Outage on auth-worker → all tool
+  calls fail. Mitigation: ADR-002 fallback path remains operational
+  per a documented env-var switch.
+
+### Alternatives considered (rejected)
+
+- **`<github_login>` placeholder via SessionStart hook.** `.mcp.json` is
+  read at session start *before* hooks complete (Claude Code hooks
+  docs: "SessionStart fires before servers finish connecting"). A
+  hook-rewritten `.mcp.json` would only apply to the *next* session,
+  defeating the goal.
+- **`install.sh` after clone.** Adds a manual step on every fresh
+  clone. Negates the "open in Claude Code Web and it just works"
+  property the MVP is chasing.
+- **broker remains in sandbox + (a) file watcher.** Keeps the ADR-002
+  host-side login step. Smaller refactor but does not deliver the
+  user-facing simplification motivating #35.
+
+### Validation (to land before flipping to Accepted)
+
+- New auth-worker route `POST /mcp` returns 200 on a valid JWT and 401
+  with the right `WWW-Authenticate` on a missing one (mirrors
+  `mcp-relay-bridge.test.ts`).
+- Host broker starts, opens WS to `wss://mcp-staging.ippoan.org/connect`,
+  registers tools, and serves a `tools/call` round-trip from a Claude
+  Code Web session opened on a fresh clone of `ippoan/cc-relay`.
+- Acceptance from #35: `mcp__cc_relay__*` (or whatever final naming) is
+  visible in the session tool namespace, and a sample tool call
+  resolves an `api.github.com/repos/ippoan/cc-relay/issues` request
+  via the host broker with status 200.
+- `docs/credentials.md` §1 rewritten; ADR-002 retained as §2 (CI /
+  fallback) — covered separately under #35 acceptance.
+
+### Phase mapping
+
+| Phase | Repo | Scope |
+|-------|------|-------|
+| **A** | `auth-worker` | new issue: `POST /mcp` + `GET /connect` user-less routes on `mcp.ippoan.org` |
+| **B** | `cc-relay`    | ADR-003 (this commit) + `.mcp.json` at repo root pointing at staging |
+| **C** | `cc-relay`    | `crates/agent-broker` → `crates/agent-mcp-server`: rmcp StreamableHttp + WS client |
+| **D** | `cc-relay`    | `rust-mcp-agent serve` subcommand: host-side broker daemon entrypoint |
+| **E** | `cc-relay`    | `docs/credentials.md` §1 rewrite; ADR-002 → §2 fallback |
+| **F** | both          | staging acceptance: fresh-clone Claude Code Web round-trip |
+| **G** | `cc-relay`    | flip ADR-003 Status to Accepted; switch `.mcp.json` to prod `mcp.ippoan.org` |
