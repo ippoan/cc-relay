@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cc-relay — Claude Code on Web エージェント間調整</title>
+  <meta name="description" content="cc-relay は Claude Code on Web 上の独立セッションを GitHub Issue 経由で連携させる stdio MCP サーバ。" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --bg-elev: #161b22;
+      --bg-code: #1c2128;
+      --border: #30363d;
+      --fg: #e6edf3;
+      --fg-mute: #8d96a0;
+      --accent: #58a6ff;
+      --accent-dim: #1f6feb;
+      --warn: #d29922;
+      --ok: #3fb950;
+      --bad: #f85149;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg); color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+      font-size: 16px; line-height: 1.65;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 2rem 0 1.5rem;
+      background: linear-gradient(180deg, var(--bg-elev) 0%, var(--bg) 100%);
+    }
+    .container { max-width: 960px; margin: 0 auto; padding: 0 1.5rem; }
+    header h1 { margin: 0 0 .35rem; font-size: 1.9rem; letter-spacing: .01em; }
+    header .tagline { margin: 0; color: var(--fg-mute); }
+    header nav { margin-top: 1rem; display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: .92rem; }
+    header nav a { color: var(--fg-mute); }
+    main { padding: 2rem 0 4rem; }
+    section { margin: 2.6rem 0; }
+    h2 {
+      font-size: 1.35rem; margin: 0 0 .8rem;
+      padding-bottom: .4rem; border-bottom: 1px solid var(--border);
+    }
+    h3 { font-size: 1.05rem; margin: 1.4rem 0 .5rem; color: var(--fg); }
+    p { margin: .6rem 0; }
+    ul, ol { padding-left: 1.4rem; }
+    li { margin: .25rem 0; }
+    code, kbd, pre {
+      font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    }
+    code {
+      background: var(--bg-code);
+      padding: .12em .35em; border-radius: 4px;
+      font-size: .88em; color: #ffa657;
+      border: 1px solid var(--border);
+    }
+    pre {
+      background: var(--bg-code); border: 1px solid var(--border);
+      padding: .9rem 1rem; border-radius: 6px;
+      overflow-x: auto; font-size: .82rem; line-height: 1.5;
+    }
+    pre code { background: none; border: none; padding: 0; color: var(--fg); }
+    table {
+      border-collapse: collapse; width: 100%;
+      margin: .8rem 0; font-size: .92rem;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: .45rem .7rem; text-align: left; vertical-align: top;
+    }
+    th { background: var(--bg-elev); font-weight: 600; }
+    .mermaid {
+      background: var(--bg-elev); border: 1px solid var(--border);
+      border-radius: 6px; padding: 1.1rem 1rem; margin: 1rem 0;
+      text-align: center; overflow-x: auto;
+    }
+    .callout {
+      border-left: 3px solid var(--accent-dim);
+      background: var(--bg-elev);
+      padding: .7rem 1rem; margin: 1rem 0;
+      border-radius: 0 4px 4px 0;
+    }
+    .callout.warn { border-color: var(--warn); }
+    .pill {
+      display: inline-block; padding: .1rem .55rem;
+      border-radius: 999px; font-size: .72rem;
+      background: var(--bg-code); border: 1px solid var(--border);
+      color: var(--fg-mute); margin-left: .35rem;
+      vertical-align: middle;
+    }
+    .pill.ok { color: var(--ok); border-color: var(--ok); }
+    .pill.todo { color: var(--warn); border-color: var(--warn); }
+    .pill.now { color: var(--accent); border-color: var(--accent); }
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 1.5rem 0; color: var(--fg-mute); font-size: .85rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>cc-relay</h1>
+      <p class="tagline">Claude Code on Web セッション間の調整レイヤ — stdio MCP + GitHub Issue ブローカー</p>
+      <nav>
+        <a href="#overview">概要</a>
+        <a href="#architecture">全体像</a>
+        <a href="#flow-bootstrap">起動フロー</a>
+        <a href="#flow-notify">通知フロー</a>
+        <a href="#flow-plan">プラン操作</a>
+        <a href="#flow-auth">認証フロー</a>
+        <a href="#roadmap">ロードマップ</a>
+        <a href="https://github.com/ippoan/cc-relay">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <section id="overview">
+      <h2>概要</h2>
+      <p>
+        <strong>cc-relay</strong> は、複数の Claude Code on Web セッションが同じタスクに並行で取り組むときに、
+        セッション間で通知と共有プランをやり取りするための小さな <em>stdio MCP サーバ</em> (<code>rust-mcp-agent</code>) と、
+        その後ろにいる <em>ブローカー</em> の組み合わせです。
+      </p>
+      <p>
+        ブローカーは <code>Broker</code> トレイトでプラガブル。MVP の実装は <strong>GitHub Issue</strong> を使います —
+        専用 Issue の <em>body</em> に共有スナップショット (アクティブなエージェント一覧 + 共有プラン) を持ち、
+        <em>comments</em> をエージェント間メッセージのログとして使う構成。Web サンドボックスから個別インフラ無しに到達できる
+        唯一の汎用永続サービスだから、というのが選定理由 (詳しくは
+        <a href="https://github.com/ippoan/cc-relay/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a> の ADR-001)。
+      </p>
+      <div class="callout">
+        <strong>ステータス:</strong> WIP。今日 (2026-05-14) で P3 (ADR-001 採用) と P4 の Broker scaffolding まで着地。
+        実 <code>GitHubBroker</code> 実装は P4b 以降。
+      </div>
+    </section>
+
+    <section id="architecture">
+      <h2>全体像</h2>
+      <p>
+        2 つの Claude Code on Web セッション (= それぞれ別 container) が、自分の中で動く stdio MCP サーバを介して
+        共有 GitHub Issue を読み書きする。直接の通信路は存在せず、すべて GitHub REST API 経由。
+      </p>
+      <div class="mermaid">
+graph TB
+  subgraph SA["Session A &nbsp;(独立 container)"]
+    direction TB
+    CA["Claude Code"]
+    MA["rust-mcp-agent &nbsp;(stdio)"]
+    IA[("/tmp/agent-inbox.jsonl")]
+    CA -- "MCP tool 呼び出し" --> MA
+    MA -- "新着 message を append" --> IA
+    IA -- "UserPromptSubmit hook" --> CA
+  end
+  subgraph SB["Session B &nbsp;(独立 container)"]
+    direction TB
+    CB["Claude Code"]
+    MB["rust-mcp-agent &nbsp;(stdio)"]
+    IB[("/tmp/agent-inbox.jsonl")]
+    CB --> MB
+    MB --> IB
+    IB --> CB
+  end
+  GH[("GitHub Issue&nbsp;(broker)<br/>body: agents + plan&nbsp;(CAS)<br/>comments: message log")]
+  MA <== "REST API (App auth)" ==> GH
+  MB <== "REST API (App auth)" ==> GH
+
+  classDef sess fill:#161b22,stroke:#30363d,color:#e6edf3
+  classDef gh fill:#1f6feb,stroke:#58a6ff,color:#fff
+  class SA,SB sess
+  class GH gh
+      </div>
+      <p>
+        Session A と Session B は <em>互いの存在を直接知らない</em>。GitHub Issue が状態の唯一の真実。
+        各セッションは自分の MCP サーバ越しに「最後に読んだ comment_id 以降」を polling して、自分宛のメッセージを inbox に書き出す。
+      </p>
+    </section>
+
+    <section id="flow-bootstrap">
+      <h2>セッション起動フロー <span class="pill ok">検証済 (2026-05-14)</span></h2>
+      <p>
+        Claude Code on Web がリポジトリを開いた瞬間に、自動で MCP サーバが立ち上がるまでの流れ。
+        2026-05-14 の probe で全往復を実測確認済み。
+      </p>
+      <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant W as Claude Code on Web
+  participant Repo as repo (default branch)
+  participant Hook as SessionStart hook
+  participant Bin as rust-mcp-agent
+
+  W->>Repo: git checkout (default branch)
+  W->>Hook: SessionStart event 発火
+  Hook->>Hook: Rust binary を準備<br/>(GitHub Release から DL or cargo build)
+  Hook-->>W: ok
+  W->>Repo: .mcp.json を読む
+  Repo-->>W: { "mcpServers": { "cc-relay": { "command": "rust-mcp-agent", "args": ["stdio"] } } }
+  W->>Bin: spawn (stdin/stdout で MCP)
+  Bin->>W: initialize → notifications/initialized → tools/list
+  W-->>Bin: ready
+  Note over W,Bin: 以降 mcp__cc-relay__notify_agent 等が使えるようになる
+      </div>
+      <p>
+        <code>.mcp.json</code> は session 起動時に 1 回だけ読まれる。途中で書き換えても効かない。
+        binary 更新時は session 再起動が必要 — これが SessionStart hook で binary を毎回最新化する設計理由。
+      </p>
+    </section>
+
+    <section id="flow-notify">
+      <h2>通知フロー (notify_agent → 相手のプロンプトに到達)</h2>
+      <p>
+        エージェント A が「ねえ B、これお願い」を投げて、エージェント B が次にプロンプト書く直前にそれを目にするまで。
+        ブローカー (GitHub Issue comments) を経由した非同期 polling。
+      </p>
+      <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant CA as Claude (A)
+  participant MA as agent-mcp (A)
+  participant GH as GitHub Issue
+  participant MB as agent-mcp (B)
+  participant Inb as inbox.jsonl (B)
+  participant CB as Claude (B)
+
+  rect rgb(31, 41, 55)
+    Note over CA,GH: 送信側
+    CA->>MA: notify_agent(to="B", msg="...")
+    MA->>GH: POST /issues/N/comments<br/>{type:"notify",to,from,msg,...}
+    GH-->>MA: 201 + comment_id
+    MA-->>CA: ok
+  end
+
+  rect rgb(31, 41, 55)
+    Note over MB,Inb: 受信側 (定期 polling)
+    MB->>GH: GET /comments?since=cursor (ETag)
+    alt 変化なし
+      GH-->>MB: 304 Not Modified
+    else 新着あり
+      GH-->>MB: 200 + [new comments]
+      MB->>MB: filter (to == B  ll  to == "*")<br/>+ exclude self-sent
+      MB->>Inb: append 各 message (JSONL)
+      MB->>MB: cursor を更新
+    end
+  end
+
+  rect rgb(31, 41, 55)
+    Note over CB,Inb: 次のプロンプト直前
+    CB->>MB: get_inbox()
+    MB->>Inb: read_all + rename → .read
+    MB-->>CB: messages 配列
+    Note over CB: messages が Claude のコンテキストに入る
+  end
+      </div>
+      <p>
+        押さえポイント:
+      </p>
+      <ul>
+        <li>遅延は polling 間隔 + GitHub API RTT で支配される (数百ms オーダー)。WebSocket より遅いが「人間のループに乗る」用途なら十分。</li>
+        <li>ETag を使うので、誰も話してない時の rate limit 消費はほぼゼロ (304 が返るだけ)。</li>
+        <li>inbox の rename によって、同じメッセージが 2 回 Claude のコンテキストに入らないことを保証。</li>
+      </ul>
+    </section>
+
+    <section id="flow-plan">
+      <h2>共有プラン操作フロー (ETag CAS)</h2>
+      <p>
+        共有プラン (タスクリスト) は Issue body に JSON snapshot として持つ。同時に複数エージェントが mutate する時の競合は
+        ETag を使った CAS (Compare-And-Swap) で解決する。
+      </p>
+      <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant A as agent-mcp
+  participant GH as GitHub Issue body
+
+  loop 最大 3 回 retry
+    A->>GH: GET /issues/N
+    GH-->>A: 200 + body(JSON) + ETag
+    A->>A: PlanOp::Claim / Update / ... を snapshot に適用
+    A->>GH: PATCH /issues/N<br/>If-Match: ETag<br/>body: 新 snapshot
+    alt 200 OK
+      GH-->>A: ok + 新 ETag
+      Note over A: cursor.last_etag を更新して return
+    else 412 Precondition Failed
+      GH-->>A: 競合 (他エージェントが先に更新)
+      Note over A: snapshot 取り直して reapply
+    end
+  end
+  Note over A: 3 回失敗 → BrokerError::Conflict { retries: 3 }
+      </div>
+      <p>
+        PlanOp の variants は <code>Add</code> / <code>Claim</code> / <code>Update</code> / <code>Remove</code>。
+        Claim はすでに他エージェント (live) に握られていれば失敗する。Done / Cancelled なタスクは再 Claim 可能。
+      </p>
+    </section>
+
+    <section id="flow-auth">
+      <h2>認証フロー (GitHub App → installation token)</h2>
+      <p>
+        ブローカーが GitHub API を叩く認証は、専用の GitHub App <code>cc-relay-agent</code> の installation token を使う。
+        PAT より:
+      </p>
+      <ul>
+        <li>token は 1 時間で自動失効 (PAT 漏洩より傷が浅い)</li>
+        <li>rate limit が 5000 req/h/installation で広い</li>
+        <li>App 単位の audit log が残る</li>
+        <li>将来 webhook で push 受信に切り替え可能</li>
+      </ul>
+      <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Env as 環境変数
+  participant Bin as rust-mcp-agent
+  participant GH as api.github.com
+
+  Note over Env: CC_RELAY_GH_APP_ID=3710243<br/>CC_RELAY_GH_INSTALLATION_ID=132248860<br/>CC_RELAY_GH_PRIVATE_KEY[_PATH]
+  Env->>Bin: 起動時に read
+  Bin->>Bin: RS256 で JWT 署名<br/>iss=APP_ID  iat=now-60s  exp=now+9m
+  Bin->>GH: POST /app/installations/INSTALL_ID/access_tokens<br/>Authorization: Bearer JWT
+  GH-->>Bin: { token: "ghs_...", expires_at: now+1h }
+  Bin->>Bin: process 内 cache
+  loop API call ごと
+    Bin->>GH: Authorization: Bearer ghs_...
+    GH-->>Bin: 200 / 401 / 429
+    alt 401 or 期限 < 5min
+      Bin->>Bin: JWT 再署名 → token 再取得
+    end
+  end
+      </div>
+      <div class="callout warn">
+        <strong>秘密鍵 (.pem):</strong> リポジトリには絶対に置かない。<code>.gitignore</code> で <code>*.pem</code>/<code>*.key</code> を弾いている。
+        管理は 1Password 等の secret store で。詳細は
+        <a href="https://github.com/ippoan/cc-relay/blob/main/docs/github-app.md">docs/github-app.md</a>。
+      </div>
+    </section>
+
+    <section id="components">
+      <h2>構成</h2>
+      <table>
+        <thead><tr><th>パス</th><th>役割</th><th>状態</th></tr></thead>
+        <tbody>
+          <tr><td><code>crates/agent-core/</code></td><td>wire protocol の値型 (Rust)</td><td><span class="pill ok">P1 済</span></td></tr>
+          <tr><td><code>crates/agent-mcp/</code></td><td>stdio MCP サーバ (<code>notify_agent</code> / <code>get_inbox</code> 等)</td><td><span class="pill ok">P2 済</span></td></tr>
+          <tr><td><code>crates/agent-cli/</code></td><td>clap dispatcher: <code>rust-mcp-agent stdio</code></td><td><span class="pill ok">P2 済</span></td></tr>
+          <tr><td><code>crates/agent-broker/</code></td><td><code>Broker</code> trait + <code>GitHubBroker</code> 実装</td><td><span class="pill now">P4 進行中</span></td></tr>
+          <tr><td><code>hooks/</code></td><td><code>.claude/hooks</code> スクリプト群</td><td><span class="pill todo">#9</span></td></tr>
+          <tr><td><code>docs/github-app.md</code></td><td>broker 用 GitHub App の設定記録</td><td><span class="pill ok">main にある</span></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="roadmap">
+      <h2>ロードマップ</h2>
+      <p>
+        詳細は <a href="https://github.com/orgs/ippoan/projects/7">project #7</a> の
+        <a href="https://github.com/ippoan/cc-relay/issues/1">Epic #1</a>。
+      </p>
+      <table>
+        <thead><tr><th>Phase</th><th>Issue</th><th>内容</th><th>状態</th></tr></thead>
+        <tbody>
+          <tr><td>P0</td><td>#2, #3</td><td>scaffolding + CI スケルトン</td><td><span class="pill ok">済</span></td></tr>
+          <tr><td>P1</td><td>#4</td><td>agent-core protocol</td><td><span class="pill ok">済</span></td></tr>
+          <tr><td>P2</td><td>#5, #6</td><td>agent-mcp stdio サーバ</td><td><span class="pill ok">済</span></td></tr>
+          <tr><td>P3</td><td>#15</td><td>ADR-001 + ワークスペース整理</td><td><span class="pill ok">済</span></td></tr>
+          <tr><td>P4</td><td>#16</td><td><code>agent-broker</code> crate (P4a/P4b/P4c 分割)</td><td><span class="pill now">進行中</span></td></tr>
+          <tr><td>P5</td><td>#17</td><td>agent-mcp を broker 経由にリファクタ</td><td><span class="pill todo">未</span></td></tr>
+          <tr><td>P6</td><td>#18</td><td>agent-cli 簡素化 + <code>--broker</code> フラグ</td><td><span class="pill todo">未</span></td></tr>
+          <tr><td>P7</td><td>#19</td><td>実 GitHub リポジトリでの E2E テスト</td><td><span class="pill todo">未</span></td></tr>
+          <tr><td>P8</td><td>#20</td><td>README 書き直し + <code>.mcp.json</code> テンプレート</td><td><span class="pill todo">未</span></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="links">
+      <h2>関連リンク</h2>
+      <ul>
+        <li><a href="https://github.com/ippoan/cc-relay">リポジトリ (ippoan/cc-relay)</a></li>
+        <li><a href="https://github.com/ippoan/cc-relay/blob/main/README.md">README</a></li>
+        <li><a href="https://github.com/ippoan/cc-relay/blob/main/ARCHITECTURE.md">ARCHITECTURE.md (ADR-001)</a></li>
+        <li><a href="https://github.com/ippoan/cc-relay/blob/main/docs/github-app.md">docs/github-app.md (App auth)</a></li>
+        <li><a href="https://github.com/orgs/ippoan/projects/7">Project board (フェーズ別ロードマップ)</a></li>
+      </ul>
+    </section>
+
+  </main>
+
+  <footer>
+    <div class="container">
+      cc-relay — <a href="https://github.com/ippoan/cc-relay">GitHub</a> ·
+      MIT or Apache-2.0 (デュアル) ·
+      生成日 2026-05-14
+    </div>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      themeVariables: {
+        background: '#161b22',
+        primaryColor: '#1f6feb',
+        primaryTextColor: '#e6edf3',
+        primaryBorderColor: '#58a6ff',
+        lineColor: '#8d96a0',
+        secondaryColor: '#21262d',
+        tertiaryColor: '#0d1117'
+      },
+      flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' },
+      sequence: { useMaxWidth: true, mirrorActors: false, wrap: true }
+    });
+  </script>
+</body>
+</html>
