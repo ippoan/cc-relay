@@ -1,64 +1,62 @@
 # cc-relay
 
-> **Status: WIP — P3 architecture pivot.** No usable binaries yet.
-> Full README rewrite lands with P8 (#20).
+> **ステータス: WIP — P3 設計転換中。** 使えるバイナリはまだ無い。
+> README の本格的な書き直しは P8 (#20) で行う。
 
-Claude Code agent-to-agent coordination layer for **Claude Code on Web**.
-Each session runs a tiny stdio MCP server (`rust-mcp-agent`) that talks to
-a shared **broker** to route notifications and a shared plan between
-agents working on the same task.
+**Claude Code on Web** 用の、エージェント間調整レイヤ。各セッションが
+小さな stdio MCP サーバ (`rust-mcp-agent`) を動かし、共有 **broker** を
+介して通知と共有プランを他エージェントとやり取りする。
 
-The broker is pluggable via a `Broker` trait (P4 / #16). The MVP backend
-is **GitHub** — a designated repo / issue carries the message stream and
-the plan — chosen because it is the only general-purpose persistent service
-reachable from the Web sandbox without per-user infrastructure setup. See
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) ADR-001 for the rationale.
+broker は `Broker` トレイトでプラガブル (P4 / #16)。MVP では **GitHub**
+が backend — 指定したリポジトリ / issue がメッセージ列とプランを保持
+する。Web サンドボックスから個別インフラ無しに到達できる唯一の汎用
+永続サービスだから (詳細は [`ARCHITECTURE.md`](./ARCHITECTURE.md) の
+ADR-001)。
 
-## Components
+## 構成
 
-| Path                   | What                                                              |
-| ---------------------- | ----------------------------------------------------------------- |
-| `crates/agent-core/`   | Wire protocol value types (Rust)                                  |
-| `crates/agent-mcp/`    | stdio MCP server (`notify_agent` / `get_inbox` / plan tools)      |
-| `crates/agent-cli/`    | thin clap dispatcher: `rust-mcp-agent stdio`                      |
-| `hooks/`               | `.claude/hooks` scripts (bootstrap, inbox, notify, cleanup)       |
+| パス                   | 中身                                                                |
+| ---------------------- | ------------------------------------------------------------------- |
+| `crates/agent-core/`   | wire protocol の値型 (Rust)                                         |
+| `crates/agent-mcp/`    | stdio MCP サーバ (`notify_agent` / `get_inbox` / plan ツール群)     |
+| `crates/agent-cli/`    | clap dispatcher: `rust-mcp-agent stdio`                             |
+| `hooks/`               | `.claude/hooks` スクリプト (bootstrap / inbox / notify / cleanup)   |
+| `docs/github-app.md`   | broker 用 GitHub App `cc-relay-agent` の設定記録                    |
 
-Crates landing in later phases:
+後続フェーズで増える crate:
 
-| Path                   | What                                                              |
-| ---------------------- | ----------------------------------------------------------------- |
-| `crates/agent-broker/` | `Broker` trait + `GitHubBroker` impl (P4 / #16)                   |
+| パス                   | 中身                                                                |
+| ---------------------- | ------------------------------------------------------------------- |
+| `crates/agent-broker/` | `Broker` トレイト + `GitHubBroker` 実装 (P4 / #16)                  |
 
-## Design
+## 設計
 
-See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the design decisions, in
-particular ADR-001 which records why the original Cloudflare-DO + WebSocket
-plan was abandoned and what replaced it.
+設計判断は [`ARCHITECTURE.md`](./ARCHITECTURE.md) を参照。特に ADR-001 が、
+当初の Cloudflare-DO + WebSocket 設計を捨てた理由と置換設計を記録して
+いる。
 
-## Roadmap
+## ロードマップ
 
-Tracked on [project #7](https://github.com/orgs/ippoan/projects/7) under
-[`Epic #1`](https://github.com/ippoan/cc-relay/issues/1) MVP.
+[project #7](https://github.com/orgs/ippoan/projects/7) の
+[`Epic #1`](https://github.com/ippoan/cc-relay/issues/1) MVP で管理。
 
-Phases:
+フェーズ:
 
-- **P0** — scaffolding + CI skeleton (#2, #3) ✅
+- **P0** — scaffolding + CI スケルトン (#2, #3) ✅
 - **P1** — agent-core protocol (#4) ✅
-- **P2** — agent-mcp stdio server (#5, #6) ✅
-- **P3** — ADR-001 + workspace cleanup (#15) ← current
+- **P2** — agent-mcp stdio サーバ (#5, #6) ✅
+- **P3** — ADR-001 + ワークスペース整理 (#15) ← 現在
 - **P4** — `agent-broker` crate (#16)
-- **P5** — `agent-mcp` refactor onto the broker (#17)
-- **P6** — `agent-cli` simplification + `--broker` flag (#18)
-- **P7** — end-to-end integration test against a real GitHub repo (#19)
-- **P8** — README rewrite + `.mcp.json` template (#20)
-- **#10** — release pipeline polish
-- **#11** — auth / observability / config
+- **P5** — `agent-mcp` を broker 経由にリファクタ (#17)
+- **P6** — `agent-cli` 簡素化 + `--broker` フラグ (#18)
+- **P7** — 実 GitHub リポジトリでの end-to-end テスト (#19)
+- **P8** — README 書き直し + `.mcp.json` テンプレート (#20)
+- **#10** — リリースパイプライン仕上げ
+- **#11** — 認証 / observability / 設定
 
-## License
+## ライセンス
 
-Dual-licensed under either of
+以下のいずれかのデュアルライセンス、選択可能:
 
 - [Apache License, Version 2.0](./LICENSE-APACHE)
 - [MIT License](./LICENSE-MIT)
-
-at your option.
