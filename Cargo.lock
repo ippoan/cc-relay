@@ -23,9 +23,11 @@ dependencies = [
 name = "agent-cli"
 version = "0.0.0"
 dependencies = [
+ "agent-broker",
  "agent-mcp",
  "anyhow",
  "clap",
+ "reqwest",
  "tokio",
  "tracing",
  "tracing-subscriber",
