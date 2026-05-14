@@ -18,9 +18,11 @@
 //! - P4c (#16) — cursor persistence + rate-limit/5xx polish.
 
 pub mod broker;
+pub mod cursor;
 pub mod github;
 pub mod types;
 
 pub use broker::Broker;
+pub use cursor::CursorStore;
 pub use github::GitHubBroker;
 pub use types::{AgentMeta, BrokerError, Cursor, Result};
