@@ -1,0 +1,41 @@
+name: tag-release
+
+# Thin wrapper around ippoan/ci-workflows's reusable `tag-release.yml`.
+# Bumps the latest `v*` tag and pushes the new tag from a bot identity
+# that has the `TAG_RELEASE_PAT` PAT — pushing the tag with a PAT (not
+# GITHUB_TOKEN) is what lets the subsequent `release.yml` workflow_run
+# fire when the tag lands.
+#
+# Trigger paths:
+# - Actions tab → tag-release → "Run workflow" (default bump=patch)
+# - The shared "ci-dashboard" / `create_tag_release` MCP tool, which
+#   POSTs to this workflow's dispatches endpoint
+#
+# After this workflow pushes `v<x>.<y>.<z>`:
+#   - `release.yml` (`on: push: tags: [v*.*.*]`) builds the musl static
+#     binary and uploads it to the new Release.
+#
+# Prereq: a `TAG_RELEASE_PAT` secret on this repo (or inherited from the
+# org). Without it the reusable workflow fails at the `git push origin`
+# step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump (patch / minor / major)"
+        required: false
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  tag-release:
+    uses: ippoan/ci-workflows/.github/workflows/tag-release.yml@main
+    with:
+      bump: ${{ inputs.bump }}
+    secrets:
+      TAG_RELEASE_PAT: ${{ secrets.TAG_RELEASE_PAT }}
