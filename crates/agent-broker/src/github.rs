@@ -12,11 +12,15 @@
 //!   pages with `per_page=100` + filters client-side (`to == me ||
 //!   to == "*"`, exclude self-sent).
 //!
-//! Authentication is a static `Authorization: Bearer <token>`. Caller
-//! owns token refresh — when the App installation token rotates, build
-//! a fresh `GitHubBroker`. P5 wires this into agent-mcp; the broker
-//! itself stays narrowly scoped.
+//! Authentication is delegated to a [`TokenManager`]. For
+//! short-lived / static credentials (tests, GitHub PAT in env) build
+//! one with [`TokenManager::static_token`]. For the end-user
+//! auth-worker flow (#33) build one with
+//! [`TokenManager::from_cache`]; `send_with_retry` then calls
+//! [`TokenManager::ensure_fresh`] at the top of every request so the
+//! bearer token never goes stale within the 5-minute skew window.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_core::{NotifyMessage, NotifyTarget, PlanOp, Priority, TaskSpec, TaskStatus};
@@ -29,6 +33,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::Broker;
+use crate::token_manager::TokenManager;
 use crate::types::{AgentMeta, BrokerError, Cursor, Result};
 
 const SNAPSHOT_VERSION: u32 = 1;
@@ -124,6 +129,10 @@ pub struct GitHubBroker {
     agent_id: String,
     http: reqwest::Client,
     base_url: String,
+    /// Source of the `Authorization` header on every request. Resolved
+    /// via [`TokenManager::ensure_fresh`] + [`TokenManager::bearer`] at
+    /// the top of `send_with_retry`.
+    tokens: Arc<TokenManager>,
     max_cas_retries: u32,
     /// 5xx / transient transport-error retry budget.
     max_transport_retries: u32,
@@ -138,10 +147,10 @@ pub struct GitHubBroker {
 }
 
 impl GitHubBroker {
-    /// Build a broker pointed at the given Issue. `token` is used as a
-    /// bearer credential on every request and is **not** refreshed by
-    /// this struct — callers (P5 wires this) rotate the installation
-    /// token by constructing a fresh `GitHubBroker`.
+    /// Build a broker that uses a fixed, never-refreshed bearer token.
+    /// Equivalent to `with_token_manager(.., TokenManager::static_token(token))`.
+    /// Convenient for tests and for callers driving the broker with a
+    /// GitHub PAT.
     pub fn new(
         owner: impl Into<String>,
         repo: impl Into<String>,
@@ -149,12 +158,27 @@ impl GitHubBroker {
         agent_id: impl Into<String>,
         token: &str,
     ) -> anyhow::Result<Self> {
+        Self::with_token_manager(
+            owner,
+            repo,
+            issue,
+            agent_id,
+            TokenManager::static_token(token),
+        )
+    }
+
+    /// Build a broker that pulls its `Authorization` header from
+    /// `tokens` on every request. Used by the auth-worker integration
+    /// (#33): callers construct a refreshable `TokenManager` via
+    /// `TokenManager::from_cache` and pass it here.
+    pub fn with_token_manager(
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        issue: u64,
+        agent_id: impl Into<String>,
+        tokens: Arc<TokenManager>,
+    ) -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("invalid token (must be ASCII-only)")?,
-        );
         headers.insert(
             ACCEPT,
             HeaderValue::from_static("application/vnd.github+json"),
@@ -177,6 +201,7 @@ impl GitHubBroker {
             agent_id: agent_id.into(),
             http,
             base_url: "https://api.github.com".to_string(),
+            tokens,
             max_cas_retries: DEFAULT_CAS_RETRIES,
             max_transport_retries: DEFAULT_TRANSPORT_RETRIES,
             backoff_start_ms: BACKOFF_START_MS,
@@ -228,7 +253,9 @@ impl GitHubBroker {
     ///
     /// `build` is called once per attempt — `reqwest::RequestBuilder`
     /// is intentionally not `Clone`, so we rebuild from the headers /
-    /// method / body each retry.
+    /// method / body each retry. The bearer token (fetched via
+    /// [`TokenManager`]) is appended here, not inside `build`, so call
+    /// sites stay auth-agnostic.
     ///
     /// Returns the first non-retryable [`reqwest::Response`] (any
     /// 1xx/2xx/3xx/4xx). The caller dispatches on its `status()`.
@@ -236,9 +263,15 @@ impl GitHubBroker {
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
+        // Refresh once before the retry loop. ensure_fresh's 5-minute
+        // skew window comfortably covers a multi-attempt retry burst,
+        // so we don't re-check on every attempt.
+        self.tokens.ensure_fresh().await?;
+        let bearer = self.tokens.bearer().await?;
+
         let mut delay_ms = self.backoff_start_ms;
         for attempt in 0..self.max_transport_retries {
-            let result = build().send().await;
+            let result = build().header(AUTHORIZATION, &bearer).send().await;
             match result {
                 Ok(resp) if resp.status().is_server_error() => {
                     tracing::warn!(

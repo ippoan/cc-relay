@@ -23,6 +23,7 @@ pub mod cursor;
 pub mod github;
 pub mod introspect;
 pub mod token_cache;
+pub mod token_manager;
 pub mod types;
 
 pub use auth::{AuthConfig, DeviceAuthorizationResponse};
@@ -31,4 +32,5 @@ pub use cursor::CursorStore;
 pub use github::GitHubBroker;
 pub use introspect::IntrospectionActive;
 pub use token_cache::TokenSet;
+pub use token_manager::TokenManager;
 pub use types::{AgentMeta, BrokerError, Cursor, Result};
