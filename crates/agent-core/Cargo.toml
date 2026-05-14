@@ -13,8 +13,16 @@ workspace = true
 
 [features]
 default = []
-# Enables blocking/async I/O helpers for /tmp/agent-inbox.jsonl. Implemented in P1.
-io = []
+# Enables async I/O helpers for /tmp/agent-inbox.jsonl. Used by agent-daemon
+# and agent-mcp; coordinator never enables this feature.
+io = ["dep:tokio"]
 
 [dependencies]
-# Filled in by P1 (#4).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# ts-rs is a `dependencies` (not dev-dependencies) entry because the export
+# happens inside a `#[test]` at the bottom of protocol.rs which lives in src/,
+# and that test compiles ts-rs into the lib's test harness.
+ts-rs = { version = "10", features = ["serde-compat"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"], optional = true }
