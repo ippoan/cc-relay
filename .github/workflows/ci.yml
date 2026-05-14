@@ -26,7 +26,7 @@ jobs:
           - kind: clippy
           - kind: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain
