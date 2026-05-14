@@ -24,6 +24,24 @@
 - **`main` に直接 push しない。** PR を開く → CI が green になれば
   auto-merge ワークフローが自動で merge する (下の「GitHub 自動化」)。
 
+## Sub-agent で並列開発する
+
+cc-relay 本体 (Broker impl) が動くまでの間、`Agent` tool で疑似的に
+multi-agent を組んで開発を進める。よく使う 3 パターン:
+
+- **並列 crate 実装** (`isolation: "worktree"`) — 独立 crate を別 worktree
+  で同時に書く。共有型 (`agent-core`) を触る変更には使わない。
+- **背景 issue 更新** (`run_in_background: true`) — tracking issue に進捗
+  コメントを淡々と投げる。本体は実装に集中する。
+- **PR 監視 / autofix** — 本体が `mcp__github__subscribe_pr_activity` で
+  webhook を待ち、CI failure 時に必要なら sub-agent に fix を委譲する。
+  `sleep` / polling は禁止。
+
+詳しい手順とプロンプト本文は [`docs/sub-agent-workflow.md`](./docs/sub-agent-workflow.md)
+と [`examples/sub-agent-recipes/`](./examples/sub-agent-recipes/) を参照。
+P4b/P5 が merge されたら、ここでの sub-agent 起動は別 Claude Code on Web
+セッション起動 + Broker 経由通信に置き換える前提で設計している。
+
 ## ビルド / テスト / lint
 
 ```
