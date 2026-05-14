@@ -198,3 +198,122 @@ Two additional observations from the probe that constrain the design:
   to ensure the agent binary exists before Claude Code reads `.mcp.json` —
   i.e. download a pinned release artifact, or `cargo install` from a tag,
   whichever phase #20 lands on.
+
+---
+
+## ADR-002: End-user auth via auth-worker MCP OAuth Provider
+
+**Status:** Accepted (2026-05-14). Issue
+[#33](https://github.com/ippoan/cc-relay/issues/33).
+
+### Context
+
+ADR-001 left `GitHubBroker` authenticating with a static GitHub token
+supplied by the caller. That suffices for the maintainer / CI path (App
+PEM → installation token, see `docs/github-app.md`), but does **not**
+work for end-users: shipping a public binary that needs the App private
+key, or asking every user to mint a PAT and paste it into env, are both
+non-starters.
+
+We needed a flow that:
+
+- Lets an end-user authenticate once on their host with no manual
+  copy-paste of credentials.
+- Yields a real `api.github.com` OAuth token with Issues r/w + private
+  repo access (so the GitHubBroker hot path stays unchanged).
+- Survives sandbox restarts (refresh works without re-prompting).
+- Requires no new infrastructure on the cc-relay side beyond a CLI
+  subcommand.
+
+[`ippoan/auth-worker`](https://github.com/ippoan/auth-worker) already
+provides this: an MCP OAuth Provider that wraps GitHub OAuth, supports
+RFC 8628 device flow, and exposes `/mcp/introspect` to swap a JWT for
+the bound GitHub OAuth token. `github-mcp-server-rs` is its existing
+consumer. Auth-worker
+[PR #131](https://github.com/ippoan/auth-worker/pull/131) finalised the
+integration contract — dynamic scope mapping
+(`mcp.write` → `read:user repo`) + a documented sandbox-reachability
+workaround.
+
+### Decision
+
+1. **Consume auth-worker; do not build our own.** No new OAuth
+   infrastructure on the cc-relay side. `crates/agent-broker/src/{auth,
+   token_cache, introspect}.rs` implement the consumer protocol
+   (device flow + introspect) by inlining patterns from
+   `github-mcp-server-rs`. A future `auth-worker-client-rs` crate can
+   replace the inlined code without touching the broker.
+2. **Host-side login, read-only mount.** `rust-mcp-agent auth` runs on
+   the host (laptop / workstation), writes `~/.cc-relay/token` with
+   mode 0600. Claude Code on Web mounts the file read-only into the
+   sandbox. The broker process inside the sandbox reads it and
+   refreshes via `TokenManager::ensure_fresh` whenever the 5-minute
+   skew window trips. This sidesteps the sandbox's allowlist block on
+   `auth.ippoan.org` (see `docs/relay-validation.md`).
+3. **GitHubBroker hot path stays direct.** The broker uses the raw
+   `github_token` extracted from `/mcp/introspect` to call
+   `api.github.com` directly — ADR-001's "GitHub-as-broker" design is
+   untouched. auth-worker is hit only on refresh, roughly once per
+   hour per session.
+4. **`INTERNAL_SHARED_SECRET` shared with `github-mcp-server-rs`.** The
+   value is distributed out-of-band by the auth-worker maintainer (see
+   `docs/credentials.md` §4). cc-relay does not embed it in the binary.
+   Long-term, auth-worker
+   [#91](https://github.com/ippoan/auth-worker/issues/91) replaces the
+   shared secret with a Service Binding.
+5. **Static `client_id = "cc-relay"`, scope = `mcp.read mcp.write`.**
+   No Dynamic Client Registration. Auth-worker's device flow does not
+   validate `client_id` — the real authorization gate is
+   `GITHUB_MCP_USER_ALLOWLIST`. JWT `aud` is fixed to
+   `"github-mcp-server-rs"` for *every* consumer (auth-worker
+   simplification).
+
+### Consequences
+
+- `GitHubBroker` no longer holds a `&str` token directly. It owns an
+  `Arc<TokenManager>` and resolves `Authorization` per-request via
+  `ensure_fresh` + `bearer`. Tests that previously passed a literal
+  string still work — `GitHubBroker::new(.., token: &str)` wraps the
+  caller in `TokenManager::static_token` internally.
+- One file is the entire on-disk surface: `~/.cc-relay/token` (mode
+  0600, plain JSON). No keyring integration, no encryption-at-rest.
+  Hardening tracked separately.
+- 30-day refresh TTL implies the user must re-run `rust-mcp-agent
+  auth` at most once a month. Reachable via `verification_uri_complete`
+  in a single browser click.
+- Sandbox reachability remains a soft dependency, not a hard one. If
+  Anthropic later allowlists `auth.ippoan.org`, the host-side mount
+  step can be retired without protocol changes (the CLI just runs
+  inside the sandbox instead).
+
+### Alternatives considered (rejected)
+
+- **PAT distribution.** Every user mints a PAT, pastes it into env.
+  Rejected as friction + leaked-PAT risk.
+- **Self-implemented device flow on a new `auth.ippoan.org`.** Already
+  exists upstream; reinventing it would diverge our crypto / KV
+  surface from the rest of the org.
+- **Streamable HTTP MCP server + Anthropic Custom Integration.** Was
+  considered (would bypass the sandbox allowlist via MCP routing). The
+  REST surface auth-worker needs for device flow / introspect is *not*
+  part of the MCP connector — so this would still require running a
+  shim. Higher complexity than host-side mount; can be revisited if
+  Phase 7 relay matures.
+- **PEM embedded in binary.** Same secrecy problem as PAT, worse
+  blast radius.
+- **VPS / Cloudflare DO / sandbox-internal token.** None solve "no
+  manual copy-paste"; they just move the secret around.
+
+### Validation
+
+- Unit tests (`crates/agent-broker/src/{auth,token_cache,introspect,token_manager}.rs`)
+  cover RFC 8628 polling, refresh, introspect happy / 401 / 503 / inactive,
+  file mode 0600, refresh-then-introspect.
+- Integration test
+  `crates/agent-broker/tests/e2e_auth_then_github.rs` runs two
+  wiremock servers (auth-worker + api.github.com) and asserts that a
+  near-expired cached token triggers refresh + introspect, and the
+  subsequent `api.github.com` call carries the new bearer.
+- Sandbox reachability probe (`scripts/probe-relay-reachability.sh`)
+  and findings (`docs/relay-validation.md`) confirm the host-side
+  mount workaround is necessary as of 2026-05-14.

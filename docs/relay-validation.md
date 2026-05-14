@@ -43,36 +43,47 @@ documented in [ADR-001](../ARCHITECTURE.md#adr-001-github-as-broker--stdio-only-
 for non-allowlisted hosts.
 
 **Conclusion:** as of 2026-05-14, the device-flow client described in #33
-cannot reach the auth-worker from a Claude Code on Web sandbox. The
-implementation work in #33 is blocked on resolving this reachability gap.
+cannot reach the auth-worker from a Claude Code on Web sandbox.
 
-## Resolution paths (from #33)
+## Adopted workaround: host-side login + read-only mount
 
-1. **(A) Allowlist `auth.ippoan.org`.** Have Claude Code on Web add the
-   host to the sandbox proxy allowlist. Lowest-risk if achievable, since
-   no architectural change is needed.
-2. **(B) Register auth-worker as a Custom Integration.** Anthropic docs
-   state MCP connector traffic is routed through the Anthropic backend
-   and bypasses the sandbox allowlist. Needs verification that this also
-   covers the auth-worker's REST endpoints (device_authorization / token
-   / introspect), not just its MCP surface.
-3. **(C) Reach auth-worker via the Phase 7 WS relay.** Would force a
-   broader redesign — cc-relay is currently stdio-MCP only — so this is
-   the fallback if (A) and (B) both fail.
+Resolved by auth-worker
+[PR #131](https://github.com/ippoan/auth-worker/pull/131) (consumer
+integration guide §4). cc-relay follows the same pattern as
+`github-mcp-server-rs`:
 
-The cross-reference issue
-[`ippoan/auth-worker#130`](https://github.com/ippoan/auth-worker/issues/130)
-tracks the upstream side of (A)/(B).
+1. The end-user runs `rust-mcp-agent auth` on the **host** (laptop /
+   workstation), where `auth.ippoan.org` is reachable normally.
+2. The resulting `~/.cc-relay/token` is mounted read-only into the
+   Claude Code on Web sandbox.
+3. The broker process inside the sandbox loads the file via
+   `TokenManager::from_cache` and refreshes within the 5-minute skew
+   window. Refresh traffic also goes through `auth.ippoan.org`, so
+   refresh has to happen on the host before mount — but the refresh
+   token's 30-day TTL makes this a once-per-month operation in
+   practice. See `docs/credentials.md` for the end-user procedure.
 
-## Re-running on future sandbox changes
+This unblocks #33 without requiring any change to the sandbox
+allowlist.
 
-If Anthropic updates the proxy allowlist (path A) or routing rules
-(path B), re-run the probe to confirm before reopening implementation
-work on #33:
+## Future paths (not blocking #33)
+
+The probe is kept in-tree because the host-side mount workaround is
+not the long-term shape. Re-run it if any of these resolve:
+
+1. **(A) Allowlist `auth.ippoan.org`.** Anthropic adds the host to the
+   sandbox proxy allowlist. The CLI would then run inside the sandbox
+   directly. Status: TBD (Anthropic side).
+2. **(B) Register auth-worker as a Custom Integration.** MCP connector
+   traffic bypasses the sandbox allowlist. Would need to cover the REST
+   surface (device_authorization / token / introspect), not just MCP.
+3. **(C) Phase 7 WS relay (`mcp.ippoan.org`).** Pre-supposes (A) since
+   the relay host itself has to be reachable.
 
 ```
 ./scripts/probe-relay-reachability.sh
 ```
 
-A clean run (exit 0, every row `reachable`) unblocks the broker-side
-work outlined in #33's "含まれるもの" section.
+A clean run (exit 0, every row `reachable`) means the host-side mount
+workaround can be retired in favour of running the CLI inside the
+sandbox.
