@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.kind }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: fmt
+          - kind: clippy
+          - kind: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        if: matrix.kind == 'fmt'
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        if: matrix.kind == 'clippy'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        if: matrix.kind == 'test'
+        run: cargo test --workspace --all-features --no-fail-fast
+
+      - name: Verify ts-rs generated TypeScript is in sync
+        if: matrix.kind == 'test'
+        run: |
+          # P1 (#4) populates coordinator/src/generated/ during `cargo test`.
+          # CI fails if the generated tree drifts from what's committed.
+          if [ -n "$(git status --porcelain coordinator/src/generated)" ]; then
+            echo "::error::coordinator/src/generated/ is out of sync with agent-core."
+            echo "Run \`cargo test -p agent-core\` and commit the result."
+            git --no-pager diff -- coordinator/src/generated
+            exit 1
+          fi
