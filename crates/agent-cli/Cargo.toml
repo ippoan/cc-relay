@@ -1,6 +1,6 @@
 [package]
 name = "agent-cli"
-description = "rust-mcp-agent binary: clap dispatcher for the daemon and stdio MCP subcommands."
+description = "rust-mcp-agent binary: clap dispatcher for the stdio MCP server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,6 @@ name = "rust-mcp-agent"
 path = "src/main.rs"
 
 [dependencies]
-agent-daemon = { path = "../agent-daemon" }
 agent-mcp = { path = "../agent-mcp" }
 
 anyhow = "1"

@@ -44,15 +44,3 @@ jobs:
       - name: cargo test
         if: matrix.kind == 'test'
         run: cargo test --workspace --all-features --no-fail-fast
-
-      - name: Verify ts-rs generated TypeScript is in sync
-        if: matrix.kind == 'test'
-        run: |
-          # P1 (#4) populates coordinator/src/generated/ during `cargo test`.
-          # CI fails if the generated tree drifts from what's committed.
-          if [ -n "$(git status --porcelain coordinator/src/generated)" ]; then
-            echo "::error::coordinator/src/generated/ is out of sync with agent-core."
-            echo "Run \`cargo test -p agent-core\` and commit the result."
-            git --no-pager diff -- coordinator/src/generated
-            exit 1
-          fi

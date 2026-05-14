@@ -1,21 +1,23 @@
 //! cc-relay stdio MCP server.
 //!
-//! Claude Code spawns this binary as an MCP server (over stdio) and the
-//! daemon (#5) is reached over `http://127.0.0.1:9876` for anything that
-//! needs to persist across Claude restarts (WebSocket, inbox, plan
-//! state).
+//! Claude Code spawns this binary as an MCP server over stdio. Tools
+//! that need to talk to other agents go through a `Broker` (P4 / #16);
+//! the inbox JSONL file is read locally for `get_inbox`.
 //!
-//! Tools exposed:
-//! - `notify_agent` — POST to daemon `/event` of type `notify`
-//! - `get_inbox` — read `/tmp/agent-inbox.jsonl` and rename it to `.read`
-//! - `get_plan` — placeholder until the daemon proxies DO plan state (#7)
-//! - `claim_task` / `update_task` — placeholder for #7 plan ops
+//! Tools exposed (P3 surface; broker wiring lands in P5):
+//! - `notify_agent` — currently posts to a stub daemon URL; swapped for a
+//!   broker call in P5 / #17.
+//! - `get_inbox` — read `/tmp/agent-inbox.jsonl` and rename it to `.read`.
+//! - `get_plan` — placeholder until the broker carries plan state (#17).
+//! - `claim_task` / `update_task` — placeholder for #17 plan ops.
+
+pub mod inbox;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_core::inbox::{self, InboxEntry};
-use agent_core::protocol::{NotifyTarget, Priority};
+use crate::inbox::{self as inbox_io, InboxEntry};
+use agent_core::{NotifyTarget, Priority};
 use anyhow::Result;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -173,7 +175,7 @@ impl AgentServer {
         &self,
         Parameters(_): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let entries = inbox::read_all(&self.inner.inbox)
+        let entries = inbox_io::read_all(&self.inner.inbox)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("read inbox: {e}"), None))?;
 

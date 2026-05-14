@@ -1,14 +1,8 @@
-//! Wire protocol types shared between the Rust daemon and the TypeScript
-//! coordinator. Rust is the source of truth; `ts-rs` exports the
-//! TypeScript definitions into `coordinator/src/generated/` as a side
-//! effect of `cargo test`.
+//! Wire protocol value types shared between `agent-mcp` and (in P4 / #16)
+//! the `agent-broker` crate. Rust is the only definition; see
+//! `ARCHITECTURE.md` ADR-001 for why ts-rs / TypeScript export was
+//! removed.
 
 pub mod protocol;
 
-#[cfg(feature = "io")]
-pub mod inbox;
-
-pub use protocol::{
-    CloseCode, FileEventKind, Hello, NotifyTarget, PlanOp, Priority, TaskSpec, TaskStatus,
-    WireMessage, PROTOCOL_VERSION,
-};
+pub use protocol::{NotifyMessage, NotifyTarget, PlanOp, Priority, TaskSpec, TaskStatus};
