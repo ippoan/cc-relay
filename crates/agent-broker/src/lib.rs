@@ -11,12 +11,16 @@
 //! transport and what the trade-offs are versus the original
 //! WebSocket-coordinator design.
 //!
-//! This crate is currently P4a scaffolding: only the trait surface and
-//! shared value types ship. The `GitHubBroker` implementation, cursor
-//! persistence, and mock-server tests follow in P4b / P4c.
+//! Status:
+//!
+//! - P4a (#16) — trait + shared value types — landed.
+//! - P4b (#16, this slice) — `GitHubBroker` impl + mock-server tests.
+//! - P4c (#16) — cursor persistence + rate-limit/5xx polish.
 
 pub mod broker;
+pub mod github;
 pub mod types;
 
 pub use broker::Broker;
+pub use github::GitHubBroker;
 pub use types::{AgentMeta, BrokerError, Cursor, Result};

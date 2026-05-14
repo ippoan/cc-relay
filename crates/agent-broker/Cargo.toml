@@ -21,8 +21,12 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 
-# Reqwest / tokio are reserved for the GitHubBroker impl that lands in P4b.
-# Pulled in now so `Broker` impls in this crate don't need to add them later
-# and so `cargo build -p agent-broker` exercises the same feature set.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt", "macros", "fs", "time", "sync"] }
+
+[dev-dependencies]
+# wiremock spins up an in-process HTTP server that GitHubBroker is pointed
+# at via `with_base_url`. Lets tests assert on request shape (headers,
+# body, query) without touching api.github.com.
+wiremock = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
