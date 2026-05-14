@@ -17,12 +17,18 @@
 //! - P4b (#16, this slice) — `GitHubBroker` impl + mock-server tests.
 //! - P4c (#16) — cursor persistence + rate-limit/5xx polish.
 
+pub mod auth;
 pub mod broker;
 pub mod cursor;
 pub mod github;
+pub mod introspect;
+pub mod token_cache;
 pub mod types;
 
+pub use auth::{AuthConfig, DeviceAuthorizationResponse};
 pub use broker::Broker;
 pub use cursor::CursorStore;
 pub use github::GitHubBroker;
+pub use introspect::IntrospectionActive;
+pub use token_cache::TokenSet;
 pub use types::{AgentMeta, BrokerError, Cursor, Result};
