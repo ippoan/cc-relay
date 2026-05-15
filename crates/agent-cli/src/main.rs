@@ -1,7 +1,7 @@
 //! `rust-mcp-agent` — clap dispatcher.
 //!
 //! Subcommands:
-//! - `stdio`   → `agent_mcp::stdio::run(broker)` — broker-backed stdio
+//! - `stdio`   → `agent_mcp::stdio::run(server)` — broker-backed stdio
 //!   MCP server (P5 / #17)
 //! - `relay`   → `agent_mcp::relay::run(server, config)` — outbound WS
 //!   to auth-worker `McpSession` DO (ADR-003 + ADR-004)
@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use agent_broker::auth::{self, default_scopes, AuthConfig, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID};
-use agent_broker::{introspect, token_cache, Broker, GitHubBroker};
+use agent_broker::{introspect, token_cache, Broker, CursorStore, GitHubBroker};
 use agent_mcp::channel::run as channel_run;
 use agent_mcp::relay::{run as relay_run, RelayConfig, RelayServer};
 use anyhow::{Context, Result};
@@ -244,6 +244,7 @@ async fn run_stdio(args: StdioArgs) -> Result<()> {
         .broker_repo
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("--broker-repo must be 'owner/repo'"))?;
+    let session_id = format!("{}/{}#{}", owner, repo, args.broker_issue);
     let broker = GitHubBroker::new(
         owner.to_string(),
         repo.to_string(),
@@ -253,7 +254,15 @@ async fn run_stdio(args: StdioArgs) -> Result<()> {
     )
     .context("build GitHubBroker")?;
     let broker: Arc<dyn Broker> = Arc::new(broker);
-    agent_mcp::stdio::run(broker)
+
+    // P5 #17 Phase 17.2: file-backed cursor for `get_inbox`. Survives
+    // process restart so a fresh `rust-mcp-agent stdio` invocation
+    // resumes where the previous one left off.
+    let cursor_store = Arc::new(CursorStore::new(&session_id).context("init CursorStore")?);
+    let server = RelayServer::new(broker)
+        .with_persisted_cursor(cursor_store)
+        .await;
+    agent_mcp::stdio::run(server)
         .await
         .context("stdio mcp exited")
 }

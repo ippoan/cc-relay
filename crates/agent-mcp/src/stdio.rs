@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use agent_broker::Broker;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -29,10 +28,13 @@ use crate::relay::RelayServer;
 /// Run the stdio MCP server until stdin closes (= Claude Code parent
 /// exited or the user terminated the subprocess).
 ///
-/// `broker` must already be configured (auth + repo + agent_id, etc.).
-/// `agent-cli`'s `run_stdio` wires this up before calling.
-pub async fn run(broker: Arc<dyn Broker>) -> Result<()> {
-    let server = Arc::new(RelayServer::new(broker));
+/// The caller constructs `RelayServer` (including any
+/// [`RelayServer::with_persisted_cursor`] wiring) before calling. This
+/// keeps the cursor-store lifecycle owned by the dispatcher in
+/// `agent-cli` so all three transports (stdio / relay / channel) can opt
+/// in independently.
+pub async fn run(server: RelayServer) -> Result<()> {
+    let server = Arc::new(server);
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 

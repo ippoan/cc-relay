@@ -32,14 +32,15 @@
 
 use std::sync::Arc;
 
-use agent_broker::Broker;
+use agent_broker::{Broker, Cursor, CursorStore};
+use agent_core::{NotifyMessage, NotifyTarget, Priority};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
@@ -138,6 +139,14 @@ pub struct RelayServer {
     ///     `meta` params) and pushes it to `notif_tx`. The stdio writer
     ///     task drains the channel and writes raw JSON-RPC lines to stdout.
     channel_mode: bool,
+    /// P5 #17 Phase 17.2: in-memory cursor advanced by every `get_inbox`
+    /// call. Initialised from `cursor_store` if one is wired; otherwise
+    /// `Cursor::beginning()` and lives only in-process.
+    cursor: Mutex<Cursor>,
+    /// P5 #17 Phase 17.2: file-backed cursor persistence
+    /// (`~/.cc-relay/state-<slug>.json`). `None` in tests / when the
+    /// caller does not care about cross-session resume.
+    cursor_store: Option<Arc<CursorStore>>,
 }
 
 impl RelayServer {
@@ -165,7 +174,24 @@ impl RelayServer {
             events,
             notif_tx: None,
             channel_mode: false,
+            cursor: Mutex::new(Cursor::beginning()),
+            cursor_store: None,
         }
+    }
+
+    /// P5 #17 Phase 17.2: install a file-backed cursor store. Loads the
+    /// persisted cursor (best effort — a missing or corrupt file resets
+    /// to `Cursor::beginning()`) before returning, so the first
+    /// `get_inbox` call after a restart resumes from the right point.
+    ///
+    /// Async because [`CursorStore::load`] hits the filesystem; callers
+    /// (`agent-cli`'s `run_stdio` / `run_relay` / `run_channel_cmd`)
+    /// already run inside the tokio runtime so the await is free.
+    pub async fn with_persisted_cursor(mut self, store: Arc<CursorStore>) -> Self {
+        let loaded = store.load().await;
+        *self.cursor.lock().await = loaded;
+        self.cursor_store = Some(store);
+        self
     }
 
     /// ADR-004 Phase D: WS 上の back-pipe を設定する。`run` から呼ばれる。
@@ -424,6 +450,33 @@ impl RelayServer {
                             "required": [],
                             "additionalProperties": false,
                         },
+                    },
+                    {
+                        "name": "notify_agent",
+                        "description": "Send a message to another agent in the cc-relay session via the configured Broker. Use `*` for `to` to broadcast to every other agent.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "to": { "type": "string" },
+                                "message": { "type": "string" },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["low", "normal", "high"]
+                                }
+                            },
+                            "required": ["to", "message"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "get_inbox",
+                        "description": "Pull all messages addressed to this agent since the last `get_inbox` call (or since the agent first joined, on cold start). Returns a JSON array of {from, to, message, priority, timestamp}. Cursor is persisted across restarts when configured.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": false,
+                        },
                     }
                 ]
             }),
@@ -463,8 +516,78 @@ impl RelayServer {
             "unsubscribe_issue_activity" => self.tool_unsubscribe_issue(id, &args),
             "get_issue_events" => self.tool_get_issue_events(id),
             "list_watched_issues" => self.tool_list_watched_issues(id),
+            "notify_agent" => self.tool_notify_agent(id, &args).await,
+            "get_inbox" => self.tool_get_inbox(id).await,
             other => error_response(id, -32602, &format!("Unknown tool: {other}")),
         }
+    }
+
+    /// P5 #17 Phase 17.2: `notify_agent` — publish a [`NotifyMessage`] via
+    /// the broker. `from` is filled from `broker.self_id()`; `priority`
+    /// defaults to `Normal` when absent; `timestamp` is wall-clock ms.
+    async fn tool_notify_agent(&self, id: Value, args: &Value) -> Value {
+        let to = match args.get("to").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s,
+            _ => return tool_text_error(id, "missing or empty 'to'"),
+        };
+        let message = match args.get("message").and_then(Value::as_str) {
+            Some(s) => s.to_string(),
+            None => return tool_text_error(id, "missing or non-string 'message'"),
+        };
+        let priority = match args.get("priority").and_then(Value::as_str) {
+            None => Priority::Normal,
+            Some("low") => Priority::Low,
+            Some("normal") => Priority::Normal,
+            Some("high") => Priority::High,
+            Some(other) => {
+                return tool_text_error(
+                    id,
+                    &format!("invalid 'priority' '{other}' (expected low|normal|high)"),
+                )
+            }
+        };
+        let target = if to == "*" {
+            NotifyTarget::All
+        } else {
+            NotifyTarget::Agent(to.to_string())
+        };
+        let from = self.broker.self_id().to_string();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let msg = NotifyMessage {
+            from,
+            to: target,
+            message,
+            priority,
+            timestamp,
+        };
+        match self.broker.send(msg).await {
+            Ok(()) => tool_text_ok(id, "ok"),
+            Err(e) => tool_text_error(id, &format!("broker error: {e}")),
+        }
+    }
+
+    /// P5 #17 Phase 17.2: `get_inbox` — pull messages addressed to this
+    /// agent since the persisted cursor; advance + save the cursor.
+    async fn tool_get_inbox(&self, id: Value) -> Value {
+        let start_cursor = self.cursor.lock().await.clone();
+        let (msgs, new_cursor) = match self.broker.fetch_since(start_cursor).await {
+            Ok(t) => t,
+            Err(e) => return tool_text_error(id, &format!("broker error: {e}")),
+        };
+        {
+            let mut guard = self.cursor.lock().await;
+            *guard = new_cursor.clone();
+        }
+        if let Some(store) = self.cursor_store.as_ref() {
+            if let Err(e) = store.save(&new_cursor).await {
+                tracing::warn!(error = %e, "cursor save failed (continuing with in-memory only)");
+            }
+        }
+        let body = serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into());
+        tool_text_ok(id, &body)
     }
 
     fn tool_subscribe_issue(&self, id: Value, args: &Value) -> Value {
@@ -754,6 +877,14 @@ mod tests {
         agents: Mutex<Vec<AgentMeta>>,
         list_agents_calls: Mutex<u32>,
         force_error: bool,
+        /// P5 #17 Phase 17.2: captured `send` invocations.
+        sent: Mutex<Vec<NotifyMessage>>,
+        /// P5 #17 Phase 17.2: payload the next `fetch_since` will return
+        /// (drained on call). The cursor returned bumps `last_comment_id`
+        /// by the number of messages returned.
+        next_fetch: Mutex<Vec<NotifyMessage>>,
+        /// When true, `send` returns Auth error to exercise the error path.
+        send_error: bool,
     }
 
     impl StubBroker {
@@ -762,6 +893,9 @@ mod tests {
                 agents: Mutex::new(agents),
                 list_agents_calls: Mutex::new(0),
                 force_error: false,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(vec![]),
+                send_error: false,
             })
         }
         fn err() -> Arc<Self> {
@@ -769,6 +903,32 @@ mod tests {
                 agents: Mutex::new(vec![]),
                 list_agents_calls: Mutex::new(0),
                 force_error: true,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(vec![]),
+                send_error: false,
+            })
+        }
+        /// Builder for Phase 17.2 tests: pre-seed messages to be returned
+        /// by the next `fetch_since` call.
+        fn with_inbox(msgs: Vec<NotifyMessage>) -> Arc<Self> {
+            Arc::new(Self {
+                agents: Mutex::new(vec![]),
+                list_agents_calls: Mutex::new(0),
+                force_error: false,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(msgs),
+                send_error: false,
+            })
+        }
+        /// Builder: `send` will return an error.
+        fn with_send_error() -> Arc<Self> {
+            Arc::new(Self {
+                agents: Mutex::new(vec![]),
+                list_agents_calls: Mutex::new(0),
+                force_error: false,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(vec![]),
+                send_error: true,
             })
         }
     }
@@ -781,11 +941,20 @@ mod tests {
         async fn leave(&self, _agent_id: &str) -> BrokerResult<()> {
             Ok(())
         }
-        async fn send(&self, _msg: NotifyMessage) -> BrokerResult<()> {
+        async fn send(&self, msg: NotifyMessage) -> BrokerResult<()> {
+            if self.send_error {
+                return Err(agent_broker::BrokerError::Auth("send stub".into()));
+            }
+            self.sent.lock().unwrap().push(msg);
             Ok(())
         }
         async fn fetch_since(&self, c: Cursor) -> BrokerResult<(Vec<NotifyMessage>, Cursor)> {
-            Ok((vec![], c))
+            let drained: Vec<NotifyMessage> = std::mem::take(&mut *self.next_fetch.lock().unwrap());
+            let advanced = Cursor {
+                last_comment_id: c.last_comment_id + drained.len() as u64,
+                last_etag: c.last_etag,
+            };
+            Ok((drained, advanced))
         }
         async fn list_agents(&self) -> BrokerResult<Vec<AgentMeta>> {
             *self.list_agents_calls.lock().unwrap() += 1;
@@ -799,6 +968,9 @@ mod tests {
         }
         async fn plan_op(&self, _op: PlanOp) -> BrokerResult<()> {
             Ok(())
+        }
+        fn self_id(&self) -> &str {
+            "stub-agent"
         }
     }
 
@@ -1134,6 +1306,9 @@ mod tests {
         assert!(names.contains(&"unsubscribe_issue_activity"));
         assert!(names.contains(&"get_issue_events"));
         assert!(names.contains(&"list_watched_issues"));
+        // P5 #17 Phase 17.2: broker-backed agent comms.
+        assert!(names.contains(&"notify_agent"));
+        assert!(names.contains(&"get_inbox"));
     }
 
     #[tokio::test]
@@ -1273,5 +1448,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // P5 #17 Phase 17.2: notify_agent + get_inbox + cursor persistence
+    // ────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tools_call_notify_agent_invokes_broker_send_with_self_id_as_from() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notify_agent","arguments":{"to":"alice","message":"hi","priority":"high"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(false));
+        let sent = broker.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let m = &sent[0];
+        assert_eq!(m.from, "stub-agent");
+        assert!(matches!(&m.to, NotifyTarget::Agent(id) if id == "alice"));
+        assert_eq!(m.message, "hi");
+        assert!(matches!(m.priority, Priority::High));
+        assert!(m.timestamp > 0);
+    }
+
+    #[tokio::test]
+    async fn tools_call_notify_agent_broadcast_maps_star_to_all() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let _ = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notify_agent","arguments":{"to":"*","message":"all hands"}}}"#,
+        )
+        .await
+        .unwrap();
+        let sent = broker.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(sent[0].to, NotifyTarget::All));
+        // priority defaults to Normal when omitted
+        assert!(matches!(sent[0].priority, Priority::Normal));
+    }
+
+    #[tokio::test]
+    async fn tools_call_notify_agent_propagates_broker_error_as_is_error_true() {
+        let broker = StubBroker::with_send_error();
+        let srv = RelayServer::new(broker);
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notify_agent","arguments":{"to":"alice","message":"hi"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(true));
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("broker error"), "text was: {text}");
+    }
+
+    #[tokio::test]
+    async fn tools_call_notify_agent_rejects_invalid_priority() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notify_agent","arguments":{"to":"alice","message":"hi","priority":"urgent"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(true));
+        // No broker.send call should have happened.
+        assert!(broker.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tools_call_get_inbox_returns_fetch_since_results_as_json_array() {
+        let msgs = vec![
+            NotifyMessage {
+                from: "alice".into(),
+                to: NotifyTarget::Agent("stub-agent".into()),
+                message: "ping".into(),
+                priority: Priority::Normal,
+                timestamp: 1_700_000_000_000,
+            },
+            NotifyMessage {
+                from: "bob".into(),
+                to: NotifyTarget::All,
+                message: "all hands".into(),
+                priority: Priority::High,
+                timestamp: 1_700_000_000_001,
+            },
+        ];
+        let broker = StubBroker::with_inbox(msgs);
+        let srv = RelayServer::new(broker);
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_inbox"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["from"], "alice");
+        assert_eq!(arr[0]["message"], "ping");
+        assert_eq!(arr[1]["from"], "bob");
+    }
+
+    #[tokio::test]
+    async fn tools_call_get_inbox_advances_in_memory_cursor() {
+        let broker = StubBroker::with_inbox(vec![NotifyMessage {
+            from: "alice".into(),
+            to: NotifyTarget::Agent("stub-agent".into()),
+            message: "ping".into(),
+            priority: Priority::Normal,
+            timestamp: 1,
+        }]);
+        let srv = RelayServer::new(broker.clone());
+        // first call → 1 msg
+        let _ = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_inbox"}}"#,
+        )
+        .await
+        .unwrap();
+        // StubBroker's next_fetch was drained → second call returns empty
+        // *and* the cursor should be at 1 (so the request is still valid).
+        let resp2 = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_inbox"}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp2["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert_eq!(arr.len(), 0);
+        // verify the in-memory cursor advanced to last_comment_id = 1
+        let c = srv.cursor.lock().await;
+        assert_eq!(c.last_comment_id, 1);
+    }
+
+    #[tokio::test]
+    async fn tools_call_get_inbox_persists_cursor_to_store() {
+        let broker = StubBroker::with_inbox(vec![NotifyMessage {
+            from: "alice".into(),
+            to: NotifyTarget::Agent("stub-agent".into()),
+            message: "ping".into(),
+            priority: Priority::Normal,
+            timestamp: 1,
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CursorStore::at_path(dir.path().join("cursor.json")));
+        let srv = RelayServer::new(broker)
+            .with_persisted_cursor(store.clone())
+            .await;
+        let _ = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_inbox"}}"#,
+        )
+        .await
+        .unwrap();
+        // file should now exist and round-trip a cursor at last_comment_id=1
+        let loaded = store.load().await;
+        assert_eq!(loaded.last_comment_id, 1);
     }
 }

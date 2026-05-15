@@ -65,4 +65,11 @@ pub trait Broker: Send + Sync + 'static {
     /// returns [`BrokerError::Conflict`](crate::BrokerError::Conflict)
     /// after exhausting its retry budget.
     async fn plan_op(&self, op: PlanOp) -> Result<()>;
+
+    /// The `agent_id` this broker instance speaks as. Used by the MCP
+    /// server to populate
+    /// [`NotifyMessage::from`](agent_core::NotifyMessage::from) when a
+    /// tool call routes through [`send`](Self::send) and to filter
+    /// self-sent messages out of [`fetch_since`](Self::fetch_since).
+    fn self_id(&self) -> &str;
 }
