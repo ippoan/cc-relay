@@ -1,12 +1,18 @@
 //! `rust-mcp-agent` — clap dispatcher.
 //!
 //! Subcommands:
-//! - `stdio` → calls `agent_mcp::run(config)` (stdio MCP server)
-//! - `auth`  → runs the auth-worker device flow and writes
-//!   `~/.cc-relay/token` (see issue #33 / ADR-002)
+//! - `stdio`   → `agent_mcp::stdio::run(broker)` — broker-backed stdio
+//!   MCP server (P5 / #17)
+//! - `relay`   → `agent_mcp::relay::run(server, config)` — outbound WS
+//!   to auth-worker `McpSession` DO (ADR-003 + ADR-004)
+//! - `channel` → `agent_mcp::channel::run(server, config)` — stdio +
+//!   outbound WS, channel notifications (ADR-005)
+//! - `auth`    → auth-worker device flow → `~/.cc-relay/token`
+//!   (issue #33 / ADR-003)
+//! - `probe`   → minimal WSS `/connect` smoke probe (#50)
 //!
 //! The `daemon` subcommand from P2 was deleted along with the
-//! `agent-daemon` crate. Broker-specific flags land in P6 / #18.
+//! `agent-daemon` crate (ADR-001 / #15).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
