@@ -6,14 +6,17 @@
 //! and uses it as the `Authorization: Bearer …` on `api.github.com`
 //! calls.
 //!
-//! Auth header: `Authorization: <INTERNAL_SHARED_SECRET>` (raw, **no**
-//! `Bearer` prefix). cc-relay shares the same secret value with
-//! `github-mcp-server-rs`; see `docs/credentials.md` §4 for how the
-//! maintainer distributes it.
+//! Auth modes (see auth-worker `mcp-introspect.ts` for the server side):
 //!
-//! Service Binding-based rewiring of this endpoint is tracked in
-//! auth-worker epic #91; until that lands, every consumer holds the
-//! shared secret.
+//! - **`Some(secret)`** — legacy shared-secret mode. `Authorization: <secret>`
+//!   (raw, no `Bearer` prefix) + body `{ "token": "<jwt>" }`. Originally
+//!   shared with `github-mcp-server-rs`; phased out (auth-worker #91).
+//! - **`None`** — Bearer JWT mode. `Authorization: Bearer <jwt>`. The JWT
+//!   itself proves the user is allowed to read their own `github_token`
+//!   (OAuth already authenticated them via DCR/PKCE or device flow). No
+//!   shared secret needed for end-user CLI. body still includes
+//!   `{ "token": "<jwt>" }` for legacy server compat — auth-worker
+//!   ignores it in mode 1.
 
 use serde::Deserialize;
 
@@ -64,19 +67,26 @@ struct IntrospectionResponse {
 ///   into the [`TokenSet`](crate::token_cache::TokenSet).
 /// - `Ok(None)` — auth-worker reports `{ active: false }`; the cached
 ///   JWT is dead and the caller must drive a refresh.
-/// - `Err(BrokerError::Auth(_))` — 401, i.e. wrong shared secret.
+/// - `Err(BrokerError::Auth(_))` — 401, i.e. wrong shared secret /
+///   invalid or expired JWT.
 /// - `Err(BrokerError::Other(_))` — 503 (auth-worker misconfigured) or
 ///   any other unexpected failure mode.
 pub async fn introspect(
     http: &reqwest::Client,
     cfg: &AuthConfig,
-    secret: &str,
+    secret: Option<&str>,
     token: &str,
 ) -> Result<Option<IntrospectionActive>> {
     let url = format!("{}/mcp/introspect", cfg.base_url);
+    // `secret = Some` → legacy mode (raw secret in header).
+    // `secret = None` → Bearer JWT mode (the token itself is the auth).
+    let auth_value = match secret {
+        Some(s) => s.to_string(),
+        None => format!("Bearer {token}"),
+    };
     let resp = http
         .post(&url)
-        .header(reqwest::header::AUTHORIZATION, secret)
+        .header(reqwest::header::AUTHORIZATION, auth_value)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&serde_json::json!({ "token": token }))
         .send()
@@ -86,7 +96,7 @@ pub async fn introspect(
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(BrokerError::Auth(
-            "introspect: invalid INTERNAL_SHARED_SECRET".into(),
+            "introspect: 401 (invalid shared secret or invalid/expired JWT)".into(),
         ));
     }
     if status.as_u16() == 503 {
@@ -157,10 +167,15 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let out = introspect(&http, &cfg(server.uri()), "shh-secret", "jwt.body.sig")
-            .await
-            .unwrap()
-            .unwrap();
+        let out = introspect(
+            &http,
+            &cfg(server.uri()),
+            Some("shh-secret"),
+            "jwt.body.sig",
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(out.github_token, "gho_xxx");
         assert_eq!(out.github_login, "octocat");
         assert_eq!(out.scope, "mcp.read mcp.write");
@@ -180,7 +195,7 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let out = introspect(&http, &cfg(server.uri()), "shh", "jwt.body.sig")
+        let out = introspect(&http, &cfg(server.uri()), Some("shh"), "jwt.body.sig")
             .await
             .unwrap();
         assert!(out.is_none());
@@ -197,9 +212,14 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let err = introspect(&http, &cfg(server.uri()), "bad-secret", "jwt.body.sig")
-            .await
-            .unwrap_err();
+        let err = introspect(
+            &http,
+            &cfg(server.uri()),
+            Some("bad-secret"),
+            "jwt.body.sig",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, BrokerError::Auth(_)));
     }
 
@@ -214,13 +234,43 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let err = introspect(&http, &cfg(server.uri()), "shh", "jwt.body.sig")
+        let err = introspect(&http, &cfg(server.uri()), Some("shh"), "jwt.body.sig")
             .await
             .unwrap_err();
         match err {
             BrokerError::Other(e) => assert!(e.to_string().contains("misconfigured")),
             other => panic!("expected Other(misconfigured), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn bearer_jwt_mode_uses_token_as_authorization() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/introspect"))
+            // Bearer mode: Authorization header is `Bearer <jwt>`, not a
+            // raw shared secret.
+            .and(header("authorization", "Bearer jwt.body.sig"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true,
+                "scope": "read:user",
+                "sub": "github:octocat",
+                "github_login": "octocat",
+                "github_token": "gho_via_bearer",
+                "exp": 1_700_003_600_i64,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let out = introspect(&http, &cfg(server.uri()), None, "jwt.body.sig")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.github_token, "gho_via_bearer");
+        assert_eq!(out.github_login, "octocat");
     }
 
     #[tokio::test]
@@ -237,7 +287,7 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let err = introspect(&http, &cfg(server.uri()), "shh", "jwt.body.sig")
+        let err = introspect(&http, &cfg(server.uri()), Some("shh"), "jwt.body.sig")
             .await
             .unwrap_err();
         assert!(matches!(err, BrokerError::Other(_)));

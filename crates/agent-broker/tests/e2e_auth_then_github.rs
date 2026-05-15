@@ -106,7 +106,7 @@ async fn refresh_then_github_request_uses_new_token() {
             client_id: "cc-relay".into(),
             scopes: vec!["mcp.read".into(), "mcp.write".into()],
         },
-        "shh-internal-secret".into(),
+        Some("shh-internal-secret".into()),
         reqwest::Client::new(),
     )
     .unwrap();
@@ -164,7 +164,7 @@ async fn no_refresh_when_token_is_fresh() {
             client_id: "cc-relay".into(),
             scopes: vec!["mcp.read".into(), "mcp.write".into()],
         },
-        "shh-internal-secret".into(),
+        Some("shh-internal-secret".into()),
         reqwest::Client::new(),
     )
     .unwrap();
