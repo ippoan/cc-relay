@@ -21,7 +21,10 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `rustls-tls-native-roots` ではなく `rustls-tls` (= webpki-roots) を使うと、
+# Claude Code on Web sandbox の HTTPS intercepting proxy CA を信頼できず
+# `UnknownIssuer` で fail する。OS trust store を読む native-roots に固定する。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["rt", "macros", "fs", "time", "sync"] }
 dirs = "5"
 
