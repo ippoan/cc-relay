@@ -43,6 +43,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::watched_issues::{IssueEventsFile, IssueKey, WatchedIssuesFile};
+
 /// Protocol version published in `initialize` and the `hello` frame. Mirrors
 /// the inline stub server's value so the wire view from a connector POV is
 /// the same regardless of which side answers.
@@ -104,11 +106,84 @@ pub struct RelayConfig {
 /// is shared across every inbound `req` frame.
 pub struct RelayServer {
     broker: Arc<dyn Broker>,
+    /// ADR-004: subscription state (re-subscribe on restart + event filter).
+    watched: WatchedIssuesFile,
+    /// ADR-004: event buffer for `get_issue_events` tool drain.
+    events: IssueEventsFile,
 }
 
 impl RelayServer {
     pub fn new(broker: Arc<dyn Broker>) -> Self {
-        Self { broker }
+        let watched_path = WatchedIssuesFile::default_path()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/.cc-relay-watched-issues.txt"));
+        let events_path = IssueEventsFile::default_path()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/.cc-relay-issue-events.jsonl"));
+        Self::with_files(
+            broker,
+            WatchedIssuesFile::new(watched_path),
+            IssueEventsFile::new(events_path),
+        )
+    }
+
+    /// テスト用 / カスタム file パスを指定する constructor。
+    pub fn with_files(
+        broker: Arc<dyn Broker>,
+        watched: WatchedIssuesFile,
+        events: IssueEventsFile,
+    ) -> Self {
+        Self {
+            broker,
+            watched,
+            events,
+        }
+    }
+
+    /// `kind:"event"` frame の本体 JSON を受け取って:
+    /// 1. `owner` / `repo` / `issue_number` を抽出
+    /// 2. `watched-issues.txt` の set にあるか filter
+    /// 3. ある場合 `issue-events.jsonl` に append
+    pub fn handle_event_frame(&self, frame_body: &Value) {
+        let owner = frame_body.get("owner").and_then(Value::as_str);
+        let repo = frame_body.get("repo").and_then(Value::as_str);
+        let number = frame_body.get("issue_number").and_then(Value::as_u64);
+        let (Some(owner), Some(repo), Some(number)) = (owner, repo, number) else {
+            tracing::warn!(
+                frame = ?frame_body,
+                "event frame missing owner/repo/issue_number"
+            );
+            return;
+        };
+        let key = IssueKey::new(owner, repo, number);
+        let watched = match self.watched.load() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %self.watched.path().display(),
+                    "load watched-issues failed; dropping event"
+                );
+                return;
+            }
+        };
+        if !watched.contains(&key) {
+            tracing::debug!(
+                issue = %key.as_filekey(),
+                "event for unwatched issue, dropping"
+            );
+            return;
+        }
+        if let Err(e) = self.events.append_event(frame_body) {
+            tracing::warn!(
+                error = %e,
+                issue = %key.as_filekey(),
+                "append event failed (event lost)"
+            );
+        } else {
+            tracing::info!(
+                issue = %key.as_filekey(),
+                "event buffered"
+            );
+        }
     }
 
     /// Process one JSON-RPC message body and produce the response body.
@@ -181,6 +256,54 @@ impl RelayServer {
                             "required": [],
                             "additionalProperties": false,
                         },
+                    },
+                    {
+                        "name": "subscribe_issue_activity",
+                        "description": "Subscribe to GitHub issue activity (comments, labels, state changes). Persists the (owner, repo, issue_number) tuple to ~/.cc-relay/watched-issues.txt. Events arriving via webhook are filtered against this set and buffered for get_issue_events. Idempotent.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "owner": { "type": "string" },
+                                "repo": { "type": "string" },
+                                "issue_number": { "type": "integer", "minimum": 1 }
+                            },
+                            "required": ["owner", "repo", "issue_number"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "unsubscribe_issue_activity",
+                        "description": "Unsubscribe from GitHub issue activity. Removes the entry from ~/.cc-relay/watched-issues.txt. Future events for this issue are dropped at the filter step. Idempotent.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "owner": { "type": "string" },
+                                "repo": { "type": "string" },
+                                "issue_number": { "type": "integer", "minimum": 1 }
+                            },
+                            "required": ["owner", "repo", "issue_number"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "get_issue_events",
+                        "description": "Drain buffered GitHub issue events received since the last call. Returns a JSON array of event objects. Subsequent calls return only newly arrived events (the file is renamed to .read on drain).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "list_watched_issues",
+                        "description": "Return the list of (owner, repo, issue_number) tuples currently subscribed via subscribe_issue_activity.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": false,
+                        },
                     }
                 ]
             }),
@@ -192,6 +315,10 @@ impl RelayServer {
             .and_then(|p| p.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        let args = params
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
         match name {
             "cc_relay_list_agents" => match self.broker.list_agents().await {
                 Ok(agents) => {
@@ -212,9 +339,121 @@ impl RelayServer {
                     }),
                 ),
             },
+            "subscribe_issue_activity" => self.tool_subscribe_issue(id, &args),
+            "unsubscribe_issue_activity" => self.tool_unsubscribe_issue(id, &args),
+            "get_issue_events" => self.tool_get_issue_events(id),
+            "list_watched_issues" => self.tool_list_watched_issues(id),
             other => error_response(id, -32602, &format!("Unknown tool: {other}")),
         }
     }
+
+    fn tool_subscribe_issue(&self, id: Value, args: &Value) -> Value {
+        let key = match parse_issue_args(args) {
+            Ok(k) => k,
+            Err(e) => return tool_text_error(id, &e),
+        };
+        match self.watched.add(&key) {
+            Ok(added) => tool_text_ok(
+                id,
+                &format!(
+                    "{} {}",
+                    if added {
+                        "subscribed:"
+                    } else {
+                        "already subscribed:"
+                    },
+                    key.as_filekey()
+                ),
+            ),
+            Err(e) => tool_text_error(id, &format!("subscribe failed: {e}")),
+        }
+    }
+
+    fn tool_unsubscribe_issue(&self, id: Value, args: &Value) -> Value {
+        let key = match parse_issue_args(args) {
+            Ok(k) => k,
+            Err(e) => return tool_text_error(id, &e),
+        };
+        match self.watched.remove(&key) {
+            Ok(removed) => tool_text_ok(
+                id,
+                &format!(
+                    "{} {}",
+                    if removed {
+                        "unsubscribed:"
+                    } else {
+                        "was not subscribed:"
+                    },
+                    key.as_filekey()
+                ),
+            ),
+            Err(e) => tool_text_error(id, &format!("unsubscribe failed: {e}")),
+        }
+    }
+
+    fn tool_get_issue_events(&self, id: Value) -> Value {
+        match self.events.drain() {
+            Ok(entries) => {
+                let body = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into());
+                tool_text_ok(id, &body)
+            }
+            Err(e) => tool_text_error(id, &format!("drain failed: {e}")),
+        }
+    }
+
+    fn tool_list_watched_issues(&self, id: Value) -> Value {
+        match self.watched.load() {
+            Ok(set) => {
+                let mut list: Vec<String> = set.iter().map(IssueKey::as_filekey).collect();
+                list.sort();
+                let body = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+                tool_text_ok(id, &body)
+            }
+            Err(e) => tool_text_error(id, &format!("load watched failed: {e}")),
+        }
+    }
+}
+
+fn parse_issue_args(args: &Value) -> std::result::Result<IssueKey, String> {
+    let owner = args
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or("missing or non-string 'owner'")?;
+    let repo = args
+        .get("repo")
+        .and_then(Value::as_str)
+        .ok_or("missing or non-string 'repo'")?;
+    let number = args
+        .get("issue_number")
+        .and_then(Value::as_u64)
+        .ok_or("missing or non-integer 'issue_number'")?;
+    if owner.is_empty() || repo.is_empty() {
+        return Err("owner and repo must not be empty".into());
+    }
+    if number == 0 {
+        return Err("issue_number must be > 0".into());
+    }
+    Ok(IssueKey::new(owner, repo, number))
+}
+
+fn tool_text_ok(id: Value, text: &str) -> Value {
+    result_response(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": false,
+        }),
+    )
+}
+
+fn tool_text_error(id: Value, text: &str) -> Value {
+    result_response(
+        id,
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": true,
+        }),
+    )
 }
 
 /// Wrap a JSON-RPC `result` payload.
@@ -278,10 +517,29 @@ pub async fn run(server: RelayServer, config: RelayConfig) -> Result<()> {
                 break;
             }
         };
-        let req: ReqFrame = match serde_json::from_str(&text) {
+        // ADR-004: webhook event frames arrive on the same WS via
+        // McpSession `/__push_event`. Peek at `kind` before parsing as
+        // ReqFrame so we can route to the issue-events handler.
+        let frame_value: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "skip malformed inbound frame (json parse)");
+                continue;
+            }
+        };
+        let kind_owned = frame_value
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+        if kind_owned == "event" {
+            server.handle_event_frame(&frame_value);
+            continue;
+        }
+        let req: ReqFrame = match serde_json::from_value(frame_value) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, "skip malformed inbound frame");
+                tracing::warn!(error = %e, kind = %kind_owned, "skip malformed inbound frame (req parse)");
                 continue;
             }
         };
@@ -393,6 +651,16 @@ mod tests {
         RelayServer::new(StubBroker::with_agents(vec![]))
     }
 
+    /// テスト用 server: watched/events を tempdir 配下に設定して、
+    /// `~/.cc-relay/*` を汚さない + 並列テストで干渉しない。
+    fn server_with_tempfiles(broker: Arc<dyn Broker>) -> (RelayServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let watched = WatchedIssuesFile::new(dir.path().join("watched.txt"));
+        let events = IssueEventsFile::new(dir.path().join("events.jsonl"));
+        let srv = RelayServer::with_files(broker, watched, events);
+        (srv, dir)
+    }
+
     async fn dispatch(srv: &RelayServer, body: &str) -> Option<Value> {
         srv.handle_jsonrpc(body.as_bytes())
             .await
@@ -436,15 +704,191 @@ mod tests {
         assert_eq!(resp["result"]["protocolVersion"], STUB_PROTOCOL_VERSION);
     }
 
+    // -----------------------------------------------------------------
+    // ADR-004 Phase C: subscribe / unsubscribe / get_issue_events /
+    // list_watched_issues + event frame handling
+    // -----------------------------------------------------------------
+
     #[tokio::test]
-    async fn tools_list_advertises_cc_relay_list_agents() {
+    async fn subscribe_then_list_watched_returns_added() {
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"ippoan","repo":"cc-relay","issue_number":42}}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("subscribed:"), "got: {text}");
+        assert!(text.contains("ippoan/cc-relay#42"));
+
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"list_watched_issues"}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let list: Vec<String> = serde_json::from_str(text).unwrap();
+        assert_eq!(list, vec!["ippoan/cc-relay#42"]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_idempotent() {
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":1}}}"#;
+        let resp1 = dispatch(&srv, body).await.unwrap();
+        let resp2 = dispatch(&srv, body).await.unwrap();
+        assert!(resp1["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("subscribed:"));
+        assert!(resp2["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("already subscribed:"));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_removes_entry() {
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":1}}}"#;
+        let unsub = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"unsubscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":1}}}"#;
+        dispatch(&srv, sub).await.unwrap();
+        let resp = dispatch(&srv, unsub).await.unwrap();
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unsubscribed:"));
+        // 2 回目 unsubscribe は "was not subscribed"
+        let resp = dispatch(&srv, unsub).await.unwrap();
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("was not subscribed:"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_invalid_args() {
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"","repo":"b","issue_number":1}}}"#;
+        let resp = dispatch(&srv, body).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":0}}}"#;
+        let resp = dispatch(&srv, body).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn handle_event_frame_filters_unwatched() {
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        // 別 issue を subscribe
+        let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"ippoan","repo":"cc-relay","issue_number":42}}}"#;
+        dispatch(&srv, sub).await.unwrap();
+
+        // 違う issue の event は drop される
+        let frame = serde_json::json!({
+            "kind": "event",
+            "v": 1,
+            "event_type": "issue_comment.created",
+            "owner": "other",
+            "repo": "repo",
+            "issue_number": 99,
+            "payload": {},
+        });
+        srv.handle_event_frame(&frame);
+
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_issue_events"}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert!(arr.is_empty(), "expected empty, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn handle_event_frame_buffers_watched_then_drains() {
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"ippoan","repo":"cc-relay","issue_number":42}}}"#;
+        dispatch(&srv, sub).await.unwrap();
+
+        let frame = serde_json::json!({
+            "kind": "event",
+            "v": 1,
+            "event_type": "issue_comment.created",
+            "owner": "ippoan",
+            "repo": "cc-relay",
+            "issue_number": 42,
+            "payload": {"action": "created"},
+        });
+        srv.handle_event_frame(&frame);
+        srv.handle_event_frame(&frame);
+
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_issue_events"}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["event_type"], "issue_comment.created");
+
+        // drain は rename するので 2 回目は空
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_issue_events"}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_event_frame_drops_when_required_fields_missing() {
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        // owner/repo/issue_number どれか欠落
+        let frame = serde_json::json!({
+            "kind": "event",
+            "v": 1,
+            "event_type": "issue_comment.created",
+            "owner": "ippoan",
+            "issue_number": 42,
+            "payload": {},
+        });
+        srv.handle_event_frame(&frame); // should not panic
+
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_issue_events"}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tools_list_advertises_all_tools() {
         let srv = server();
         let resp = dispatch(&srv, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .await
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "cc_relay_list_agents");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        // ADR-004 Phase C: subscribe/unsubscribe/get_issue_events/list_watched_issues 追加。
+        assert!(names.contains(&"cc_relay_list_agents"));
+        assert!(names.contains(&"subscribe_issue_activity"));
+        assert!(names.contains(&"unsubscribe_issue_activity"));
+        assert!(names.contains(&"get_issue_events"));
+        assert!(names.contains(&"list_watched_issues"));
     }
 
     #[tokio::test]
