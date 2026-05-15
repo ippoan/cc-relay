@@ -603,6 +603,10 @@ impl Broker for GitHubBroker {
     async fn plan_op(&self, op: PlanOp) -> Result<()> {
         self.cas_update(move |snap| apply_plan_op(snap, &op)).await
     }
+
+    fn self_id(&self) -> &str {
+        &self.agent_id
+    }
 }
 
 /// Apply a single [`PlanOp`] to an in-memory snapshot. Pulled out into
