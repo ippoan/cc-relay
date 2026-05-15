@@ -78,7 +78,7 @@ struct StdioArgs {
 
     /// GitHub installation token for the broker. Distinct from the MCP
     /// access JWT used by `relay` / `channel`. See `docs/github-app.md`.
-    #[arg(long, env = "CC_RELAY_BROKER_TOKEN")]
+    #[arg(long, env = "CC_RELAY_BROKER_TOKEN", hide_env_values = true)]
     broker_token: String,
 
     /// Broker Issue number. Used by `GitHubBroker` as the canonical
@@ -119,7 +119,7 @@ struct RelayArgs {
     /// JWT (which authenticates the WS upgrade). See `docs/github-app.md`.
     /// Phase D will move this behind a credential-resolver; Phase C accepts
     /// it inline so the binary can be smoke-tested without further setup.
-    #[arg(long, env = "CC_RELAY_BROKER_TOKEN")]
+    #[arg(long, env = "CC_RELAY_BROKER_TOKEN", hide_env_values = true)]
     broker_token: String,
 
     /// Broker Issue number. Used by `GitHubBroker` as the canonical
@@ -158,7 +158,7 @@ struct ChannelArgs {
 
     /// GitHub installation token for the broker. Phase A accepts it inline
     /// like `relay` mode does; credential-resolver work is a follow-up.
-    #[arg(long, env = "CC_RELAY_BROKER_TOKEN")]
+    #[arg(long, env = "CC_RELAY_BROKER_TOKEN", hide_env_values = true)]
     broker_token: String,
 
     /// Broker Issue number. Required for `GitHubBroker::new`.
@@ -188,7 +188,7 @@ struct AuthArgs {
     /// in `auth-worker/src/handlers/mcp-introspect.ts`). End-users do
     /// not need to set this; it remains for CI / `github-mcp-server-rs`
     /// backward-compat.
-    #[arg(long, env = "CC_RELAY_AUTH_INTROSPECT_SECRET")]
+    #[arg(long, env = "CC_RELAY_AUTH_INTROSPECT_SECRET", hide_env_values = true)]
     introspect_secret: Option<String>,
 
     /// Where to write the token file. Defaults to `~/.cc-relay/token`.
