@@ -1,12 +1,18 @@
 //! `rust-mcp-agent` — clap dispatcher.
 //!
 //! Subcommands:
-//! - `stdio` → calls `agent_mcp::run(config)` (stdio MCP server)
-//! - `auth`  → runs the auth-worker device flow and writes
-//!   `~/.cc-relay/token` (see issue #33 / ADR-002)
+//! - `stdio`   → `agent_mcp::stdio::run(broker)` — broker-backed stdio
+//!   MCP server (P5 / #17)
+//! - `relay`   → `agent_mcp::relay::run(server, config)` — outbound WS
+//!   to auth-worker `McpSession` DO (ADR-003 + ADR-004)
+//! - `channel` → `agent_mcp::channel::run(server, config)` — stdio +
+//!   outbound WS, channel notifications (ADR-005)
+//! - `auth`    → auth-worker device flow → `~/.cc-relay/token`
+//!   (issue #33 / ADR-003)
+//! - `probe`   → minimal WSS `/connect` smoke probe (#50)
 //!
 //! The `daemon` subcommand from P2 was deleted along with the
-//! `agent-daemon` crate. Broker-specific flags land in P6 / #18.
+//! `agent-daemon` crate (ADR-001 / #15).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,7 +23,6 @@ use agent_broker::auth::{self, default_scopes, AuthConfig, DEFAULT_BASE_URL, DEF
 use agent_broker::{introspect, token_cache, Broker, GitHubBroker};
 use agent_mcp::channel::run as channel_run;
 use agent_mcp::relay::{run as relay_run, RelayConfig, RelayServer};
-use agent_mcp::McpConfig;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -65,15 +70,25 @@ enum Cmd {
 
 #[derive(Debug, Parser)]
 struct StdioArgs {
-    /// Stub field carried over from P2. P5 / #17 replaces this with a
-    /// `--broker` flag and the URL is no longer used.
-    #[arg(long, default_value = "http://127.0.0.1:9876")]
-    daemon_url: String,
+    /// GitHub broker repo in `owner/repo` form (host of the broker Issue).
+    /// Required: stdio mode now dispatches every tool call through a real
+    /// `GitHubBroker` per ADR-001 / #17.
+    #[arg(long, env = "CC_RELAY_BROKER_REPO")]
+    broker_repo: String,
 
-    /// JSONL inbox path. Read by `check-inbox.sh` at `UserPromptSubmit`
-    /// and by the `get_inbox` MCP tool.
-    #[arg(long, default_value = "/tmp/agent-inbox.jsonl")]
-    inbox: PathBuf,
+    /// GitHub installation token for the broker. Distinct from the MCP
+    /// access JWT used by `relay` / `channel`. See `docs/github-app.md`.
+    #[arg(long, env = "CC_RELAY_BROKER_TOKEN")]
+    broker_token: String,
+
+    /// Broker Issue number. Used by `GitHubBroker` as the canonical
+    /// agents / plan / notify document.
+    #[arg(long, env = "CC_RELAY_BROKER_ISSUE")]
+    broker_issue: u64,
+
+    /// Agent id this binary advertises in `Broker::join` etc.
+    #[arg(long, default_value = "stdio-agent")]
+    agent_id: String,
 }
 
 #[derive(Debug, Parser)]
@@ -225,11 +240,22 @@ fn main() -> ExitCode {
 }
 
 async fn run_stdio(args: StdioArgs) -> Result<()> {
-    let config = McpConfig {
-        daemon_url: args.daemon_url,
-        inbox: args.inbox,
-    };
-    agent_mcp::run(config).await.context("stdio mcp exited")
+    let (owner, repo) = args
+        .broker_repo
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("--broker-repo must be 'owner/repo'"))?;
+    let broker = GitHubBroker::new(
+        owner.to_string(),
+        repo.to_string(),
+        args.broker_issue,
+        args.agent_id,
+        &args.broker_token,
+    )
+    .context("build GitHubBroker")?;
+    let broker: Arc<dyn Broker> = Arc::new(broker);
+    agent_mcp::stdio::run(broker)
+        .await
+        .context("stdio mcp exited")
 }
 
 async fn run_relay(args: RelayArgs) -> Result<()> {
