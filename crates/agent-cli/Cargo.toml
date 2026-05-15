@@ -21,7 +21,11 @@ agent-mcp = { path = "../agent-mcp" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# webpki-roots ではなく OS trust store を読み込ませる必要がある (詳細は
+# `crates/agent-broker/Cargo.toml` のコメント参照、Claude Code on Web の
+# HTTPS intercepting proxy CA との互換性のため)。workspace の reqwest
+# feature unification 目的でこちらも合わせて native-roots に固定。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
