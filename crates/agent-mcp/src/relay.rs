@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use agent_broker::{Broker, Cursor, CursorStore};
-use agent_core::{NotifyMessage, NotifyTarget, Priority};
+use agent_core::{NotifyMessage, NotifyTarget, PlanOp, Priority, TaskSpec, TaskStatus};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -477,6 +477,76 @@ impl RelayServer {
                             "required": [],
                             "additionalProperties": false,
                         },
+                    },
+                    {
+                        "name": "get_plan",
+                        "description": "Return the current shared plan as a JSON array of TaskSpec ({id, title, status, assignee?, notes?}).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "add_task",
+                        "description": "Add a new task to the shared plan. `id` must be unique within the session. `status` defaults to `pending`.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "title": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done", "cancelled"]
+                                },
+                                "assignee": { "type": "string" },
+                                "notes": { "type": "string" }
+                            },
+                            "required": ["id", "title"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "claim_task",
+                        "description": "Take ownership of a task. Fails if already assigned to a different live agent and not yet Done/Cancelled. Assignee is this binary's `agent_id` (from broker.self_id()).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": { "type": "string" }
+                            },
+                            "required": ["task_id"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "update_task",
+                        "description": "Update a task's status and (optionally) notes.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done", "cancelled"]
+                                },
+                                "notes": { "type": "string" }
+                            },
+                            "required": ["task_id", "status"],
+                            "additionalProperties": false,
+                        },
+                    },
+                    {
+                        "name": "remove_task",
+                        "description": "Drop a task entirely from the shared plan.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": { "type": "string" }
+                            },
+                            "required": ["task_id"],
+                            "additionalProperties": false,
+                        },
                     }
                 ]
             }),
@@ -518,6 +588,11 @@ impl RelayServer {
             "list_watched_issues" => self.tool_list_watched_issues(id),
             "notify_agent" => self.tool_notify_agent(id, &args).await,
             "get_inbox" => self.tool_get_inbox(id).await,
+            "get_plan" => self.tool_get_plan(id).await,
+            "add_task" => self.tool_add_task(id, &args).await,
+            "claim_task" => self.tool_claim_task(id, &args).await,
+            "update_task" => self.tool_update_task(id, &args).await,
+            "remove_task" => self.tool_remove_task(id, &args).await,
             other => error_response(id, -32602, &format!("Unknown tool: {other}")),
         }
     }
@@ -590,6 +665,114 @@ impl RelayServer {
         tool_text_ok(id, &body)
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // P5 #17 Phase 17.3: plan ops (get_plan + add/claim/update/remove_task)
+    // ────────────────────────────────────────────────────────────────────
+
+    async fn tool_get_plan(&self, id: Value) -> Value {
+        match self.broker.get_plan().await {
+            Ok(plan) => {
+                let body = serde_json::to_string(&plan).unwrap_or_else(|_| "[]".into());
+                tool_text_ok(id, &body)
+            }
+            Err(e) => tool_text_error(id, &format!("broker error: {e}")),
+        }
+    }
+
+    async fn tool_add_task(&self, id: Value, args: &Value) -> Value {
+        let task_id = match args.get("id").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return tool_text_error(id, "missing or empty 'id'"),
+        };
+        let title = match args.get("title").and_then(Value::as_str) {
+            Some(s) => s.to_string(),
+            None => return tool_text_error(id, "missing or non-string 'title'"),
+        };
+        let status = match args.get("status").and_then(Value::as_str) {
+            None => TaskStatus::Pending,
+            Some(s) => match parse_task_status(s) {
+                Some(st) => st,
+                None => return tool_text_error(id, &format!("invalid 'status' '{s}'")),
+            },
+        };
+        let assignee = args
+            .get("assignee")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let notes = args
+            .get("notes")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let task = TaskSpec {
+            id: task_id,
+            title,
+            status,
+            assignee,
+            notes,
+        };
+        match self.broker.plan_op(PlanOp::Add { task }).await {
+            Ok(()) => tool_text_ok(id, "ok"),
+            Err(e) => tool_text_error(id, &format!("broker error: {e}")),
+        }
+    }
+
+    async fn tool_claim_task(&self, id: Value, args: &Value) -> Value {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return tool_text_error(id, "missing or empty 'task_id'"),
+        };
+        let agent_id = self.broker.self_id().to_string();
+        match self
+            .broker
+            .plan_op(PlanOp::Claim { task_id, agent_id })
+            .await
+        {
+            Ok(()) => tool_text_ok(id, "ok"),
+            Err(e) => tool_text_error(id, &format!("broker error: {e}")),
+        }
+    }
+
+    async fn tool_update_task(&self, id: Value, args: &Value) -> Value {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return tool_text_error(id, "missing or empty 'task_id'"),
+        };
+        let status = match args.get("status").and_then(Value::as_str) {
+            Some(s) => match parse_task_status(s) {
+                Some(st) => st,
+                None => return tool_text_error(id, &format!("invalid 'status' '{s}'")),
+            },
+            None => return tool_text_error(id, "missing or non-string 'status'"),
+        };
+        let notes = args
+            .get("notes")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match self
+            .broker
+            .plan_op(PlanOp::Update {
+                task_id,
+                status,
+                notes,
+            })
+            .await
+        {
+            Ok(()) => tool_text_ok(id, "ok"),
+            Err(e) => tool_text_error(id, &format!("broker error: {e}")),
+        }
+    }
+
+    async fn tool_remove_task(&self, id: Value, args: &Value) -> Value {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return tool_text_error(id, "missing or empty 'task_id'"),
+        };
+        match self.broker.plan_op(PlanOp::Remove { task_id }).await {
+            Ok(()) => tool_text_ok(id, "ok"),
+            Err(e) => tool_text_error(id, &format!("broker error: {e}")),
+        }
+    }
+
     fn tool_subscribe_issue(&self, id: Value, args: &Value) -> Value {
         let key = match parse_issue_args(args) {
             Ok(k) => k,
@@ -654,6 +837,19 @@ impl RelayServer {
             }
             Err(e) => tool_text_error(id, &format!("load watched failed: {e}")),
         }
+    }
+}
+
+/// Parse the `status` argument of `add_task` / `update_task` into the
+/// internal [`TaskStatus`] enum. Returns `None` for any string outside
+/// the snake_case schema, mirroring the tool's `inputSchema` enum list.
+fn parse_task_status(s: &str) -> Option<TaskStatus> {
+    match s {
+        "pending" => Some(TaskStatus::Pending),
+        "in_progress" => Some(TaskStatus::InProgress),
+        "done" => Some(TaskStatus::Done),
+        "cancelled" => Some(TaskStatus::Cancelled),
+        _ => None,
     }
 }
 
@@ -885,6 +1081,13 @@ mod tests {
         next_fetch: Mutex<Vec<NotifyMessage>>,
         /// When true, `send` returns Auth error to exercise the error path.
         send_error: bool,
+        /// P5 #17 Phase 17.3: captured `plan_op` invocations.
+        plan_ops: Mutex<Vec<PlanOp>>,
+        /// P5 #17 Phase 17.3: payload `get_plan` returns.
+        plan_snapshot: Mutex<Vec<TaskSpec>>,
+        /// When true, `plan_op` returns Auth error to exercise the error
+        /// path independently of `send_error`.
+        plan_op_error: bool,
     }
 
     impl StubBroker {
@@ -896,6 +1099,9 @@ mod tests {
                 sent: Mutex::new(vec![]),
                 next_fetch: Mutex::new(vec![]),
                 send_error: false,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(vec![]),
+                plan_op_error: false,
             })
         }
         fn err() -> Arc<Self> {
@@ -906,6 +1112,9 @@ mod tests {
                 sent: Mutex::new(vec![]),
                 next_fetch: Mutex::new(vec![]),
                 send_error: false,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(vec![]),
+                plan_op_error: false,
             })
         }
         /// Builder for Phase 17.2 tests: pre-seed messages to be returned
@@ -918,6 +1127,9 @@ mod tests {
                 sent: Mutex::new(vec![]),
                 next_fetch: Mutex::new(msgs),
                 send_error: false,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(vec![]),
+                plan_op_error: false,
             })
         }
         /// Builder: `send` will return an error.
@@ -929,6 +1141,38 @@ mod tests {
                 sent: Mutex::new(vec![]),
                 next_fetch: Mutex::new(vec![]),
                 send_error: true,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(vec![]),
+                plan_op_error: false,
+            })
+        }
+        /// Builder for Phase 17.3 tests: pre-seed the plan returned by
+        /// `get_plan`.
+        fn with_plan(plan: Vec<TaskSpec>) -> Arc<Self> {
+            Arc::new(Self {
+                agents: Mutex::new(vec![]),
+                list_agents_calls: Mutex::new(0),
+                force_error: false,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(vec![]),
+                send_error: false,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(plan),
+                plan_op_error: false,
+            })
+        }
+        /// Builder: `plan_op` will return an error.
+        fn with_plan_op_error() -> Arc<Self> {
+            Arc::new(Self {
+                agents: Mutex::new(vec![]),
+                list_agents_calls: Mutex::new(0),
+                force_error: false,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(vec![]),
+                send_error: false,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(vec![]),
+                plan_op_error: true,
             })
         }
     }
@@ -964,9 +1208,13 @@ mod tests {
             Ok(self.agents.lock().unwrap().clone())
         }
         async fn get_plan(&self) -> BrokerResult<Vec<TaskSpec>> {
-            Ok(vec![])
+            Ok(self.plan_snapshot.lock().unwrap().clone())
         }
-        async fn plan_op(&self, _op: PlanOp) -> BrokerResult<()> {
+        async fn plan_op(&self, op: PlanOp) -> BrokerResult<()> {
+            if self.plan_op_error {
+                return Err(agent_broker::BrokerError::Auth("plan_op stub".into()));
+            }
+            self.plan_ops.lock().unwrap().push(op);
             Ok(())
         }
         fn self_id(&self) -> &str {
@@ -1309,6 +1557,12 @@ mod tests {
         // P5 #17 Phase 17.2: broker-backed agent comms.
         assert!(names.contains(&"notify_agent"));
         assert!(names.contains(&"get_inbox"));
+        // P5 #17 Phase 17.3: shared plan ops.
+        assert!(names.contains(&"get_plan"));
+        assert!(names.contains(&"add_task"));
+        assert!(names.contains(&"claim_task"));
+        assert!(names.contains(&"update_task"));
+        assert!(names.contains(&"remove_task"));
     }
 
     #[tokio::test]
@@ -1615,5 +1869,184 @@ mod tests {
         // file should now exist and round-trip a cursor at last_comment_id=1
         let loaded = store.load().await;
         assert_eq!(loaded.last_comment_id, 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // P5 #17 Phase 17.3: get_plan + add/claim/update/remove_task
+    // ────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tools_call_get_plan_returns_broker_snapshot_as_json_array() {
+        let plan = vec![
+            TaskSpec {
+                id: "T1".into(),
+                title: "Review auth".into(),
+                status: TaskStatus::Pending,
+                assignee: None,
+                notes: None,
+            },
+            TaskSpec {
+                id: "T2".into(),
+                title: "Wire broker".into(),
+                status: TaskStatus::InProgress,
+                assignee: Some("alice".into()),
+                notes: Some("WIP".into()),
+            },
+        ];
+        let broker = StubBroker::with_plan(plan);
+        let srv = RelayServer::new(broker);
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_plan"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(false));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "T1");
+        assert_eq!(arr[0]["status"], "pending");
+        assert_eq!(arr[1]["assignee"], "alice");
+        assert_eq!(arr[1]["status"], "in_progress");
+    }
+
+    #[tokio::test]
+    async fn tools_call_add_task_invokes_broker_plan_op_add() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_task","arguments":{"id":"T1","title":"Review","status":"in_progress","assignee":"alice","notes":"WIP"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(false));
+        let ops = broker.plan_ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            PlanOp::Add { task } => {
+                assert_eq!(task.id, "T1");
+                assert_eq!(task.title, "Review");
+                assert!(matches!(task.status, TaskStatus::InProgress));
+                assert_eq!(task.assignee.as_deref(), Some("alice"));
+                assert_eq!(task.notes.as_deref(), Some("WIP"));
+            }
+            other => panic!("expected PlanOp::Add, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_add_task_defaults_status_to_pending_when_omitted() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let _ = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_task","arguments":{"id":"T2","title":"Plain task"}}}"#,
+        )
+        .await
+        .unwrap();
+        let ops = broker.plan_ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        let PlanOp::Add { task } = &ops[0] else {
+            panic!("expected Add");
+        };
+        assert!(matches!(task.status, TaskStatus::Pending));
+        assert!(task.assignee.is_none());
+        assert!(task.notes.is_none());
+    }
+
+    #[tokio::test]
+    async fn tools_call_claim_task_uses_self_id_as_assignee() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"claim_task","arguments":{"task_id":"T1"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(false));
+        let ops = broker.plan_ops.lock().unwrap();
+        match &ops[0] {
+            PlanOp::Claim { task_id, agent_id } => {
+                assert_eq!(task_id, "T1");
+                assert_eq!(agent_id, "stub-agent");
+            }
+            other => panic!("expected PlanOp::Claim, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_update_task_passes_status_and_notes() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let _ = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_task","arguments":{"task_id":"T1","status":"done","notes":"shipped"}}}"#,
+        )
+        .await
+        .unwrap();
+        let ops = broker.plan_ops.lock().unwrap();
+        match &ops[0] {
+            PlanOp::Update {
+                task_id,
+                status,
+                notes,
+            } => {
+                assert_eq!(task_id, "T1");
+                assert!(matches!(status, TaskStatus::Done));
+                assert_eq!(notes.as_deref(), Some("shipped"));
+            }
+            other => panic!("expected PlanOp::Update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_update_task_rejects_invalid_status() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_task","arguments":{"task_id":"T1","status":"reopen"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(true));
+        assert!(broker.plan_ops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tools_call_remove_task_invokes_broker_plan_op_remove() {
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let _ = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remove_task","arguments":{"task_id":"T9"}}}"#,
+        )
+        .await
+        .unwrap();
+        let ops = broker.plan_ops.lock().unwrap();
+        match &ops[0] {
+            PlanOp::Remove { task_id } => assert_eq!(task_id, "T9"),
+            other => panic!("expected PlanOp::Remove, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_plan_op_propagates_broker_error_as_is_error_true() {
+        let broker = StubBroker::with_plan_op_error();
+        let srv = RelayServer::new(broker);
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"claim_task","arguments":{"task_id":"T1"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], serde_json::Value::Bool(true));
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("broker error"), "text was: {text}");
     }
 }
