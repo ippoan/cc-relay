@@ -25,9 +25,11 @@ thiserror = "2"
 tracing = "0.1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "sync"] }
-# NOTE: tokio-tungstenite の `rustls-tls-webpki-roots` は同 PR では触っていない。
-# sandbox からの wss 挙動が未検証のため follow-up に分ける (Phase F #37)。
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "url"] }
+# Issue #50 / Phase F #37: CCoW container は HTTPS intercepting proxy の独自 CA を
+# 信頼する必要があるため、reqwest と同じく OS trust store (`rustls-tls-native-roots`)
+# に揃える。webpki-roots だと sandbox 内で `UnknownIssuer` で fail する
+# (`rust-mcp-agent probe` で実測済み)。
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots", "url"] }
 # reqwest は OS trust store を読む native-roots に固定 (詳細は
 # `crates/agent-broker/Cargo.toml` のコメント参照)。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }

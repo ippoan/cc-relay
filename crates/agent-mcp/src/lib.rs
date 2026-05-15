@@ -13,6 +13,7 @@
 
 pub mod channel;
 pub mod inbox;
+pub mod probe;
 pub mod relay;
 pub mod watched_issues;
 

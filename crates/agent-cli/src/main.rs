@@ -16,6 +16,7 @@ use std::sync::Arc;
 use agent_broker::auth::{self, default_scopes, AuthConfig, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID};
 use agent_broker::{introspect, token_cache, Broker, GitHubBroker};
 use agent_mcp::channel::run as channel_run;
+use agent_mcp::probe::{run as probe_run, ProbeConfig};
 use agent_mcp::relay::{run as relay_run, RelayConfig, RelayServer};
 use agent_mcp::McpConfig;
 use anyhow::{Context, Result};
@@ -61,6 +62,13 @@ enum Cmd {
     /// `notifications/claude/channel` JSON-RPC notification, which Claude
     /// Code injects into the session context as `<channel source="cc-relay" ...>`.
     Channel(ChannelArgs),
+
+    /// Issue #50 A 案 PoC: open WSS /connect, send `hello`, append every
+    /// received frame to a log file. No broker, no MCP tool surface — the
+    /// goal is to characterise turn-internal long-poll behaviour from a
+    /// CCoW container before deciding whether a hook can inject events
+    /// without polling.
+    Probe(ProbeArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -156,6 +164,39 @@ struct ChannelArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProbeArgs {
+    /// Full WebSocket URL to probe. Issue #50 background notes that the
+    /// per-user form `wss://mcp-staging.ippoan.org/u/<owner>/connect` reaches
+    /// the edge from a CCoW container; the user-less `…/connect` default is
+    /// kept here for parity with `relay`/`channel` modes.
+    #[arg(
+        long,
+        env = "CC_RELAY_WS_URL",
+        default_value = "wss://mcp-staging.ippoan.org/connect"
+    )]
+    ws_url: String,
+
+    /// Path to the cached MCP access token (written by `auth`). Mutually
+    /// exclusive with `--access-token`; one of the two MUST be provided.
+    #[arg(long, conflicts_with = "access_token")]
+    token_path: Option<PathBuf>,
+
+    /// Raw MCP JWT to send as `Authorization: Bearer <token>`. Reads from
+    /// `CC_RELAY_PROBE_TOKEN` env if not on the command line.
+    #[arg(long, env = "CC_RELAY_PROBE_TOKEN", hide_env_values = true)]
+    access_token: Option<String>,
+
+    /// Where to append received frames as JSONL.
+    #[arg(long, default_value = "/tmp/cc-relay-probe.jsonl")]
+    log: PathBuf,
+
+    /// Stop after N frames (excluding ping/pong logging). Default: run
+    /// until peer closes or process is killed.
+    #[arg(long)]
+    max_frames: Option<usize>,
+}
+
+#[derive(Debug, Parser)]
 struct AuthArgs {
     /// Auth-worker base URL. Override for staging / local testing.
     #[arg(long, env = "CC_RELAY_AUTH_BASE_URL", default_value = DEFAULT_BASE_URL)]
@@ -212,6 +253,7 @@ fn main() -> ExitCode {
             Cmd::Auth(args) => run_auth(args).await,
             Cmd::Relay(args) => run_relay(args).await,
             Cmd::Channel(args) => run_channel_cmd(args).await,
+            Cmd::Probe(args) => run_probe(args).await,
         }
     });
 
@@ -308,6 +350,38 @@ async fn run_channel_cmd(args: ChannelArgs) -> Result<()> {
     channel_run(server, cfg)
         .await
         .context("channel loop exited")
+}
+
+async fn run_probe(args: ProbeArgs) -> Result<()> {
+    let access_token = match (args.access_token, args.token_path) {
+        (Some(t), _) => t,
+        (None, Some(p)) => {
+            let token_set = token_cache::load(&p)
+                .with_context(|| format!("read token cache at {}", p.display()))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no cached token at {}; run `rust-mcp-agent auth` first",
+                        p.display()
+                    )
+                })?;
+            token_set.access_token
+        }
+        (None, None) => {
+            anyhow::bail!(
+                "probe requires either --access-token / CC_RELAY_PROBE_TOKEN or --token-path"
+            );
+        }
+    };
+
+    let cfg = ProbeConfig {
+        ws_url: args.ws_url,
+        access_token,
+        log_path: args.log,
+        max_frames: args.max_frames,
+    };
+    let count = probe_run(cfg).await.context("probe loop exited")?;
+    eprintln!("rust-mcp-agent: probe wrote {count} frame(s)");
+    Ok(())
 }
 
 async fn run_auth(args: AuthArgs) -> Result<()> {
