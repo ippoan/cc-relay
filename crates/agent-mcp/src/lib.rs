@@ -13,6 +13,7 @@
 
 pub mod inbox;
 pub mod relay;
+pub mod watched_issues;
 
 use std::path::PathBuf;
 use std::sync::Arc;
