@@ -55,11 +55,13 @@ enum Mode {
     Refreshable(Box<RefreshableInner>),
 }
 
+// `secret` is `Option<String>`: `Some` → legacy shared-secret mode on
+// `/mcp/introspect`; `None` → Bearer-JWT mode (CLI / end-user default).
 struct RefreshableInner {
     state: RwLock<TokenSet>,
     cache_path: PathBuf,
     cfg: AuthConfig,
-    secret: String,
+    secret: Option<String>,
     http: reqwest::Client,
 }
 
@@ -84,7 +86,7 @@ impl TokenManager {
     pub fn from_cache(
         cache_path: PathBuf,
         cfg: AuthConfig,
-        secret: String,
+        secret: Option<String>,
         http: reqwest::Client,
     ) -> Result<Arc<Self>> {
         let set = token_cache::load(&cache_path)?.ok_or_else(|| {
@@ -127,11 +129,14 @@ impl TokenManager {
 
         let refresh_token = r.state.read().await.refresh_token.clone();
         let new_set = auth::refresh(&r.http, &r.cfg, &refresh_token).await?;
-        let active = introspect::introspect(&r.http, &r.cfg, &r.secret, &new_set.access_token)
-            .await?
-            .ok_or_else(|| {
-                BrokerError::Auth("refresh succeeded but introspect returned inactive token".into())
-            })?;
+        let active =
+            introspect::introspect(&r.http, &r.cfg, r.secret.as_deref(), &new_set.access_token)
+                .await?
+                .ok_or_else(|| {
+                    BrokerError::Auth(
+                        "refresh succeeded but introspect returned inactive token".into(),
+                    )
+                })?;
         let new_set = new_set.with_github_token(active.github_token);
         token_cache::save(&r.cache_path, &new_set)?;
         *r.state.write().await = new_set;
@@ -216,7 +221,7 @@ mod tests {
         let m = TokenManager::from_cache(
             path,
             cfg(server.uri()),
-            "shh".into(),
+            Some("shh".into()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -258,7 +263,7 @@ mod tests {
         let m = TokenManager::from_cache(
             cache_path.clone(),
             cfg(server.uri()),
-            "shh".into(),
+            Some("shh".into()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -291,7 +296,7 @@ mod tests {
         let m = TokenManager::from_cache(
             cache_path,
             cfg(server.uri()),
-            "shh".into(),
+            Some("shh".into()),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -310,7 +315,7 @@ mod tests {
         let err = TokenManager::from_cache(
             bogus,
             cfg("http://unused".into()),
-            "shh".into(),
+            Some("shh".into()),
             reqwest::Client::new(),
         )
         .unwrap_err();
@@ -327,7 +332,7 @@ mod tests {
         let err = TokenManager::from_cache(
             cache_path,
             cfg("http://unused".into()),
-            "shh".into(),
+            Some("shh".into()),
             reqwest::Client::new(),
         )
         .unwrap_err();

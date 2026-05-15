@@ -121,9 +121,12 @@ struct AuthArgs {
     #[arg(long, env = "CC_RELAY_CLIENT_ID", default_value = DEFAULT_CLIENT_ID)]
     client_id: String,
 
-    /// `INTERNAL_SHARED_SECRET` for the auth-worker introspect endpoint.
-    /// Distributed out-of-band by the auth-worker maintainer; see
-    /// `docs/credentials.md` §4. Required.
+    /// `INTERNAL_SHARED_SECRET` for the auth-worker introspect endpoint
+    /// (legacy mode). Optional: when omitted, the CLI calls
+    /// `/mcp/introspect` with `Authorization: Bearer <MCP_JWT>` (mode 1
+    /// in `auth-worker/src/handlers/mcp-introspect.ts`). End-users do
+    /// not need to set this; it remains for CI / `github-mcp-server-rs`
+    /// backward-compat.
     #[arg(long, env = "CC_RELAY_AUTH_INTROSPECT_SECRET")]
     introspect_secret: Option<String>,
 
@@ -219,16 +222,10 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
 }
 
 async fn run_auth(args: AuthArgs) -> Result<()> {
-    let secret = args
-        .introspect_secret
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "--introspect-secret (or CC_RELAY_AUTH_INTROSPECT_SECRET) is required; \
-                 obtain it from the auth-worker maintainer (see docs/credentials.md §4)"
-            )
-        })?;
+    // `secret = None` → introspect via Bearer JWT (recommended for
+    // end-users; no shared secret distribution). `Some(_)` keeps the
+    // legacy shared-secret call path for CI / github-mcp-server-rs.
+    let secret = args.introspect_secret.as_deref().filter(|s| !s.is_empty());
 
     let token_path = match args.token_path {
         Some(p) => p,

@@ -1,8 +1,14 @@
 # cc-relay credentials
 
 How end-users and maintainers authenticate cc-relay to GitHub. See
-[ADR-002](../ARCHITECTURE.md#adr-002-end-user-auth-via-auth-worker-mcp-oauth-provider)
-for the design rationale.
+[ADR-003](../ARCHITECTURE.md#adr-003-sandbox-auth-via-claude-code-mcp-connector--auth-worker-user-less-relay)
+for the current design (ADR-002 is the host-mount fallback).
+
+> **ADR-003 status update.** §1 has been rewritten to drop the
+> `INTERNAL_SHARED_SECRET` requirement on end-user `auth` — the CLI now
+> introspects via Bearer JWT (see §4). §2 (host mount) and §3 (host-side
+> refresh) describe the ADR-002 fallback path and only apply when the
+> binary runs on your laptop instead of the sandbox.
 
 Two flows coexist:
 
@@ -15,20 +21,23 @@ You only need the end-user flow. The maintainer flow is documented in
 [`docs/github-app.md`](./github-app.md) and is used by CI workflows and
 release tooling.
 
-## §1. First-time setup (host)
+## §1. First-time setup
 
-Run **on your host** (laptop / workstation), not inside the Claude Code
-on Web sandbox. The sandbox cannot reach `auth.ippoan.org` directly;
-see `docs/relay-validation.md` for the reachability findings and §2
-below for how the resulting token reaches the sandbox.
+Under ADR-003 (Claude Code on Web), the binary runs **inside the
+sandbox**, not on your laptop. From any session shell:
 
 ```
-export CC_RELAY_AUTH_INTROSPECT_SECRET=<value from maintainer>
 rust-mcp-agent auth
 ```
 
+No env vars needed for end-users. The CLI calls `/mcp/introspect`
+with `Authorization: Bearer <MCP_JWT>` (mode 1 in
+`auth-worker/src/handlers/mcp-introspect.ts`); the JWT obtained from
+the device flow IS the authentication, so `INTERNAL_SHARED_SECRET`
+distribution is no longer required for end-users (see §4).
+
 `rust-mcp-agent` prints a `https://auth.ippoan.org/...` URL and a
-per-session user code. Open the URL in a browser, approve the GitHub
+per-session user code. Open the URL in any browser, approve the GitHub
 consent screen, and the CLI exits with:
 
 ```
@@ -85,19 +94,25 @@ The broker reads the file via `TokenManager::from_cache(...)`. Writes
   auth-worker maintainer to add your GitHub login to the allowlist
   (see §5).
 
-## §4. Obtaining `INTERNAL_SHARED_SECRET`
+## §4. `INTERNAL_SHARED_SECRET` (legacy mode)
 
-`POST /mcp/introspect` requires `Authorization: <secret>` where the
-secret is shared between all auth-worker consumers (currently
-`github-mcp-server-rs` and cc-relay).
+`POST /mcp/introspect` accepts **two** auth modes (see
+`auth-worker/src/handlers/mcp-introspect.ts`):
 
-- **End-users:** ask the auth-worker maintainer for the value, store
-  it in `CC_RELAY_AUTH_INTROSPECT_SECRET` (env), don't check it in.
-- **CI:** GitHub Actions Secret `CC_RELAY_AUTH_INTROSPECT_SECRET`.
-- **Long-term:** auth-worker
-  [#91](https://github.com/ippoan/auth-worker/issues/91) replaces the
-  shared secret with a Cloudflare Service Binding, at which point
-  cc-relay can drop the env var.
+- **Mode 1 — Bearer JWT** (default for end-user `rust-mcp-agent auth`).
+  `Authorization: Bearer <MCP_JWT>`. OAuth has already authenticated the
+  user; the JWT itself proves they may read their own `github_token`.
+  **No env var required.**
+- **Mode 2 — Shared secret** (legacy; `github-mcp-server-rs` and CI).
+  `Authorization: <INTERNAL_SHARED_SECRET>` (raw, no `Bearer` prefix).
+  Pass via `CC_RELAY_AUTH_INTROSPECT_SECRET` if you need to exercise
+  the legacy path (CI, dual-consumer tests).
+
+End-users on Claude Code on Web should never set
+`CC_RELAY_AUTH_INTROSPECT_SECRET`. The legacy mode will be removed once
+`github-mcp-server-rs` has migrated and auth-worker
+[#91](https://github.com/ippoan/auth-worker/issues/91) (Service Binding)
+lands.
 
 ## §5. Allowlist registration
 
