@@ -247,7 +247,9 @@ async fn run_stdio(args: StdioArgs) -> Result<()> {
     )
     .context("build GitHubBroker")?;
     let broker: Arc<dyn Broker> = Arc::new(broker);
-    agent_mcp::stdio::run(broker).await.context("stdio mcp exited")
+    agent_mcp::stdio::run(broker)
+        .await
+        .context("stdio mcp exited")
 }
 
 async fn run_relay(args: RelayArgs) -> Result<()> {
