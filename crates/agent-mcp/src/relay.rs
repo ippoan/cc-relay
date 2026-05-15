@@ -39,6 +39,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
@@ -110,6 +111,11 @@ pub struct RelayServer {
     watched: WatchedIssuesFile,
     /// ADR-004: event buffer for `get_issue_events` tool drain.
     events: IssueEventsFile,
+    /// ADR-004 Phase D: outbound back-pipe to auth-worker. When `Some`, every
+    /// successful `handle_event_frame` also sends a `kind:"notif"` frame
+    /// wrapping a JSON-RPC `notifications/message` so the auth-worker DO can
+    /// fan it out to attached SSE channels. `None` in tests (no real WS).
+    notif_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl RelayServer {
@@ -135,7 +141,14 @@ impl RelayServer {
             broker,
             watched,
             events,
+            notif_tx: None,
         }
+    }
+
+    /// ADR-004 Phase D: WS 上の back-pipe を設定する。`run` から呼ばれる。
+    /// テストではセットしない (no-op になる)。
+    pub fn set_notif_sender(&mut self, tx: mpsc::UnboundedSender<String>) {
+        self.notif_tx = Some(tx);
     }
 
     /// `kind:"event"` frame の本体 JSON を受け取って:
@@ -178,11 +191,43 @@ impl RelayServer {
                 issue = %key.as_filekey(),
                 "append event failed (event lost)"
             );
-        } else {
-            tracing::info!(
-                issue = %key.as_filekey(),
-                "event buffered"
-            );
+            return;
+        }
+        tracing::info!(
+            issue = %key.as_filekey(),
+            "event buffered"
+        );
+
+        // ADR-004 Phase D: auth-worker McpSession DO に `kind:"notif"` frame で
+        // MCP `notifications/message` を back-pipe。DO 側で attached SSE channel
+        // 全部に fan-out される (Anthropic Claude.ai / Claude Code Web の real-time
+        // wake-up 経路)。notif_tx が None のテストでは silent no-op。
+        let Some(tx) = self.notif_tx.as_ref() else {
+            return;
+        };
+        let notif_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "info",
+                "logger": "cc-relay/issue-events",
+                "data": frame_body,
+            },
+        });
+        let frame = json!({
+            "kind": "notif",
+            "v": FRAME_VERSION,
+            "body": notif_body,
+        });
+        let payload = match serde_json::to_string(&frame) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "notif frame serialize failed");
+                return;
+            }
+        };
+        if let Err(e) = tx.send(payload) {
+            tracing::warn!(error = %e, "notif back-pipe send failed (ws writer dropped)");
         }
     }
 
@@ -471,7 +516,11 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 /// Loops on inbound `req` frames; per frame, decodes the body, runs
 /// [`RelayServer::handle_jsonrpc`], and sends back a `resp` frame. Returns
 /// only when the WS closes (caller decides whether to reconnect).
-pub async fn run(server: RelayServer, config: RelayConfig) -> Result<()> {
+///
+/// ADR-004 Phase D: WS への送信は全て mpsc channel 経由にする。
+/// `handle_event_frame` も同じ channel で `kind:"notif"` frame を流すので、
+/// reader loop と event handler が同じ sink を奪い合う race を避ける。
+pub async fn run(mut server: RelayServer, config: RelayConfig) -> Result<()> {
     let mut request = config
         .ws_url
         .as_str()
@@ -491,6 +540,22 @@ pub async fn run(server: RelayServer, config: RelayConfig) -> Result<()> {
 
     let (mut sink, mut stream) = ws.split();
 
+    // ADR-004 Phase D: 送信は全部 channel 経由。handle_event_frame からも
+    // back-pipe する notif frame を流すため。writer は別 task で drain する。
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    server.set_notif_sender(out_tx.clone());
+
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if let Err(e) = sink.send(Message::Text(msg)).await {
+                tracing::warn!(error = %e, "ws sink write failed; closing writer");
+                break;
+            }
+        }
+        // sink を flush + close。drop だけだと TCP RST になる事があるので明示。
+        let _ = sink.close().await;
+    });
+
     // hello frame — informational, DO ignores it for Phase 6/7 but logs it.
     let hello = HelloFrame {
         kind: "hello",
@@ -498,20 +563,34 @@ pub async fn run(server: RelayServer, config: RelayConfig) -> Result<()> {
         binary_version: SERVER_VERSION,
         proto: FRAME_VERSION,
     };
-    sink.send(Message::Text(serde_json::to_string(&hello)?))
-        .await
-        .context("send hello frame failed")?;
+    out_tx
+        .send(serde_json::to_string(&hello)?)
+        .context("send hello frame failed (writer dead)")?;
 
+    let result = pump_inbound(&server, &mut stream, &out_tx).await;
+
+    // writer task を終了させる: tx を drop すれば channel が close、writer task は
+    // recv() で None を返して抜ける。
+    drop(out_tx);
+    let _ = writer.await;
+
+    result
+}
+
+/// 受信 loop 本体。`run()` から切り出して、writer task の cleanup を 1 箇所に
+/// まとめる。
+async fn pump_inbound(
+    server: &RelayServer,
+    stream: &mut (impl StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+              + Unpin),
+    out_tx: &mpsc::UnboundedSender<String>,
+) -> Result<()> {
     while let Some(message) = stream.next().await {
         let message = message.context("ws stream error")?;
         let text = match message {
             Message::Text(t) => t,
             Message::Binary(b) => String::from_utf8(b).context("non-utf8 binary frame")?,
-            Message::Ping(p) => {
-                sink.send(Message::Pong(p)).await.ok();
-                continue;
-            }
-            Message::Pong(_) | Message::Frame(_) => continue,
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             Message::Close(_) => {
                 tracing::info!("agent-mcp relay: ws closed by peer");
                 break;
@@ -576,9 +655,10 @@ pub async fn run(server: RelayServer, config: RelayConfig) -> Result<()> {
                 B64.encode(&body_out)
             },
         };
-        sink.send(Message::Text(serde_json::to_string(&resp)?))
-            .await
-            .context("send resp frame failed")?;
+        if out_tx.send(serde_json::to_string(&resp)?).is_err() {
+            tracing::warn!("writer task dropped; aborting pump");
+            break;
+        }
     }
     Ok(())
 }
