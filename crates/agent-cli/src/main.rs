@@ -11,8 +11,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use std::sync::Arc;
+
 use agent_broker::auth::{self, default_scopes, AuthConfig, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID};
-use agent_broker::{introspect, token_cache};
+use agent_broker::{introspect, token_cache, Broker, GitHubBroker};
+use agent_mcp::relay::{run as relay_run, RelayConfig, RelayServer};
 use agent_mcp::McpConfig;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -43,6 +46,11 @@ enum Cmd {
     /// Run the auth-worker device flow and write `~/.cc-relay/token`.
     /// See `docs/credentials.md`.
     Auth(AuthArgs),
+
+    /// ADR-003 Phase C: open an outbound WS to the auth-worker MCP relay
+    /// (`wss://mcp(-staging).ippoan.org/connect`) and serve as the host-side
+    /// MCP server that Claude.ai connector POSTs land on. Long-running.
+    Relay(RelayArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -56,6 +64,49 @@ struct StdioArgs {
     /// and by the `get_inbox` MCP tool.
     #[arg(long, default_value = "/tmp/agent-inbox.jsonl")]
     inbox: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct RelayArgs {
+    /// Full WebSocket URL of the auth-worker user-less relay endpoint.
+    /// Override for prod (`wss://mcp.ippoan.org/connect`) once Phase G lands.
+    #[arg(
+        long,
+        env = "CC_RELAY_WS_URL",
+        default_value = "wss://mcp-staging.ippoan.org/connect"
+    )]
+    ws_url: String,
+
+    /// Path to the cached MCP access token (written by `auth` subcommand).
+    /// The `access_token` field is sent verbatim as `Authorization: Bearer ...`
+    /// on the WS upgrade. JWT refresh on expiry is a follow-up (token TTL is
+    /// 1h; a 1h-bounded session is acceptable for the Phase C smoke test).
+    #[arg(long)]
+    token_path: Option<PathBuf>,
+
+    /// GitHub broker repo in `owner/repo` form (host of the broker Issue).
+    /// `cc_relay_list_agents` is the only tool wired in this Phase C cut, so
+    /// the broker only needs read access to its issue body.
+    #[arg(long, env = "CC_RELAY_BROKER_REPO")]
+    broker_repo: String,
+
+    /// GitHub installation token for the broker. Distinct from the MCP access
+    /// JWT (which authenticates the WS upgrade). See `docs/github-app.md`.
+    /// Phase D will move this behind a credential-resolver; Phase C accepts
+    /// it inline so the binary can be smoke-tested without further setup.
+    #[arg(long, env = "CC_RELAY_BROKER_TOKEN")]
+    broker_token: String,
+
+    /// Broker Issue number. Used by `GitHubBroker` as the canonical
+    /// agents/plan/notify document.
+    #[arg(long, env = "CC_RELAY_BROKER_ISSUE")]
+    broker_issue: u64,
+
+    /// Agent id this binary advertises in `Broker::join` etc. Defaults to
+    /// `host-broker`. The Phase C tool surface (`cc_relay_list_agents`) does
+    /// not call `join`, but later tools (`notify_agent`) will.
+    #[arg(long, default_value = "host-broker")]
+    agent_id: String,
 }
 
 #[derive(Debug, Parser)]
@@ -110,6 +161,7 @@ fn main() -> ExitCode {
         match cli.cmd {
             Cmd::Stdio(args) => run_stdio(args).await,
             Cmd::Auth(args) => run_auth(args).await,
+            Cmd::Relay(args) => run_relay(args).await,
         }
     });
 
@@ -128,6 +180,42 @@ async fn run_stdio(args: StdioArgs) -> Result<()> {
         inbox: args.inbox,
     };
     agent_mcp::run(config).await.context("stdio mcp exited")
+}
+
+async fn run_relay(args: RelayArgs) -> Result<()> {
+    let token_path = match args.token_path {
+        Some(p) => p,
+        None => token_cache::default_path().context("resolve default token path")?,
+    };
+    let token_set = token_cache::load(&token_path)
+        .with_context(|| format!("read token cache at {}", token_path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no cached token at {}; run `rust-mcp-agent auth` first",
+                token_path.display()
+            )
+        })?;
+
+    let (owner, repo) = args
+        .broker_repo
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("--broker-repo must be 'owner/repo'"))?;
+    let broker = GitHubBroker::new(
+        owner.to_string(),
+        repo.to_string(),
+        args.broker_issue,
+        args.agent_id,
+        &args.broker_token,
+    )
+    .context("build GitHubBroker")?;
+    let broker: Arc<dyn Broker> = Arc::new(broker);
+
+    let server = RelayServer::new(broker);
+    let cfg = RelayConfig {
+        ws_url: args.ws_url,
+        access_token: token_set.access_token,
+    };
+    relay_run(server, cfg).await.context("relay loop exited")
 }
 
 async fn run_auth(args: AuthArgs) -> Result<()> {

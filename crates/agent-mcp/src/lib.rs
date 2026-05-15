@@ -12,6 +12,7 @@
 //! - `claim_task` / `update_task` — placeholder for #17 plan ops.
 
 pub mod inbox;
+pub mod relay;
 
 use std::path::PathBuf;
 use std::sync::Arc;
