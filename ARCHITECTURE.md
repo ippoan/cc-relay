@@ -470,51 +470,46 @@ the JWT's `github_login` claim closes the gap and lets the same
 
 ## ADR-004: GitHub issue activity webhooks via auth-worker + IssueSubsDO
 
-**Status:** Proposed (2026-05-15). Replaces "みて" manual-polling workflow.
+**Status:** Proposed (2026-05-15)。「みて」手動 polling を廃止する。
 
 ### Context
 
-ADR-001/002/003 stand. Sessions can authenticate to `mcp.ippoan.org` and
-broker tools (`notify_agent`, `get_inbox`, ...) round-trip through the
-WebSocket relay. **But state changes on GitHub issues today only reach
-the active session through polling.**
+ADR-001/002/003 は据え置き。session は `mcp.ippoan.org` に認証して
+broker tool (`notify_agent` / `get_inbox` / ...) を WebSocket relay 経由
+で叩ける。**だが GitHub issue 上の state 変化を active session が知る
+手段は polling しかない。**
 
-Anthropic-provided `subscribe_pr_activity` covers Pull Requests via
-server-side webhook delivery into `<github-webhook-activity>` messages,
-which wake the session even if the user has the browser closed. *Issues
-have no equivalent tool* — there is no `subscribe_issue_activity` in the
-Anthropic MCP toolset.
+Anthropic が用意する `subscribe_pr_activity` は PR 用に server-side
+webhook を `<github-webhook-activity>` 形式で配信し、browser を閉じた
+session も wake する。**issue 版は存在しない** — Anthropic MCP toolset
+に `subscribe_issue_activity` は無い。
 
-Concrete user pain (2026-05-15 session): each round of "create issue →
-ask another session to do work → wait for reply comment" required the
-operator to manually type `みて` to trigger an `issue_read` call. This
-makes "agent task threads on issues" viable in principle but exhausting
-in practice.
+実際の痛み (2026-05-15 session): 「issue 作る → 別 session に作業させる
+→ 返信コメントを待つ」のラウンドごとに operator が手で `みて` と打って
+`issue_read` を発火させる必要があった。「agent task thread を issue で
+回す」発想は成立するが、運用が消耗する。
 
-Workarounds we rejected before landing here:
+ここに着地する前に却下した workaround:
 
-- **In-process polling inside `rust-mcp-agent`.** Authenticated polling
-  on the GitHub API runs at full rate-limit and feels fine while the
-  CCoW container is hot. But the container is *reclaimed after a few
-  hours of inactivity* (per Claude Code on the web docs), the tokio
-  task dies, and any event posted during the gap is silently dropped
-  on resume. Solving the wake problem from inside a hibernate-prone
-  container is structurally impossible without external delivery.
-- **PR-per-task (with `subscribe_pr_activity`).** Works today with
-  zero infra change, but creates empty PRs for non-code tasks. A
-  workable stopgap, not the right shape for "GitHub Issue を broker
-  にした agent 間メッセージ relay" (cc-relay's stated purpose).
+- **`rust-mcp-agent` 内 in-process polling。** authenticated polling
+  なら rate-limit は問題にならず、container が hot な間は機能する。
+  しかし CCoW container は数時間無動作で reclaim される (Claude Code
+  on the web 公式 docs)。tokio task は死に、reclaim 中に発生した
+  event は再 wake 時に拾えない。**hibernate しやすい container の中
+  から wake を解く方法は構造的に存在しない** — 外部からの配信が必須。
+- **PR-per-task (`subscribe_pr_activity` 利用)。** インフラ追加ゼロで
+  今日動くが、コード変更のない task のために empty PR が貯まる。
+  繋ぎとしてはありだが、「GitHub Issue を broker にした agent 間
+  メッセージ relay」という cc-relay 本来の形ではない。
 
-The right architecture: `auth-worker` already terminates user
-WebSocket connections in `McpSession` DOs keyed by `github_login`. It
-can equally well terminate **inbound GitHub webhooks** and route them
-into the same DO surface. cc-relay's MCP layer exposes the
-subscribe/unsubscribe tools; the WebSocket frame schema grows one new
-`kind`.
+正解の形: `auth-worker` は既に `McpSession` DO (per `github_login`) で
+user の WebSocket を終端している。同じ場所で **inbound GitHub webhook**
+も終端すれば、同じ DO surface で routing できる。cc-relay 側は MCP tool
+2 個と WS frame の新 `kind` 1 個を追加するだけで完結する。
 
 ### Decision
 
-#### High-level
+#### 全体像
 
 ```
 ┌──────────────────────┐   POST /webhooks/github   ┌────────────────────┐
@@ -530,7 +525,7 @@ subscribe/unsubscribe tools; the WebSocket frame schema grows one new
                                 ┌────────────────────────────┼───────────────┐
                                 │                            │               │
                                 ▼                            ▼               ▼
-                  ┌─────────────────────┐     ┌─────────────────────┐  ... (per matched github_login)
+                  ┌─────────────────────┐     ┌─────────────────────┐  ... (matched github_login ごと)
                   │  IssueSubsDO        │     │  McpSession DO      │
                   │  (per owner/repo#N) │────▶│  (per github_login) │
                   │  storage: sub:*     │     │  push_event RPC     │
@@ -541,7 +536,7 @@ subscribe/unsubscribe tools; the WebSocket frame schema grows one new
                                               ┌─────────────────────┐
                                               │  rust-mcp-agent     │
                                               │  (host container)   │
-                                              │  emit MCP notif     │
+                                              │  MCP notif 発火     │
                                               └──────────┬──────────┘
                                                          │ <github-webhook-activity>
                                                          ▼
@@ -551,8 +546,8 @@ subscribe/unsubscribe tools; the WebSocket frame schema grows one new
                                               └─────────────────────┘
 ```
 
-No KV. State lives entirely in Durable Objects. Strongly consistent,
-no per-read $-cost.
+KV は使わない。state は全部 Durable Objects 上。strongly consistent、
+read ごとの $-cost なし。
 
 #### Webhook receiver (`auth-worker`)
 
@@ -565,45 +560,48 @@ Headers:
 Body: GitHub event payload (JSON)
 ```
 
-Handler steps:
+Handler の処理:
 
-1. HMAC-SHA256 verify against `env.GITHUB_WEBHOOK_SECRET` using the
-   constant-time compare helper already in `lineworks-webhook.ts`.
-2. If `X-GitHub-Event` ∉ `{issues, issue_comment}` → 200 ignore.
-3. Parse payload → `{owner, repo, issue_number, event_type,
-   delivery_id, payload_subset}`.
-4. `idFromName(`subs:${owner}/${repo}#${number}`)` → `IssueSubsDO` stub.
-5. `stub.fetch('/__list')` → array of subscriber `github_login`s.
-6. Fan-out: for each `github_login` →
-   `MCP_SESSION_DO.idFromName(login)` → `stub.fetch('/__push_event',
-   {body: framePayload})`. Errors swallowed per-target (one stalled
-   session must not block others).
-7. Respond 200 to GitHub immediately after dispatch (don't await fan-out
-   completion if it becomes a latency issue — start with awaited).
+1. `env.GITHUB_WEBHOOK_SECRET` を鍵に HMAC-SHA256 検証。`lineworks-webhook.ts`
+   既存の constant-time compare helper を流用。
+2. `X-GitHub-Event` が `{issues, issue_comment}` 以外なら 200 で
+   ignore。
+3. payload から `{owner, repo, issue_number, event_type,
+   delivery_id, payload_subset}` を抽出。
+4. `idFromName(`subs:${owner}/${repo}#${number}`)` で `IssueSubsDO`
+   stub を取得。
+5. `stub.fetch('/__list')` で subscriber `github_login` 配列を取得。
+6. fan-out: 各 `github_login` ごとに
+   `MCP_SESSION_DO.idFromName(login)` で stub を取り、`/__push_event`
+   に frame payload を POST。**1 個の session の失敗が他を blocking
+   しないよう per-target で error を握り潰す**。
+7. fan-out 完了後 GitHub には 200 を返す (遅延が問題化したら fire-and-
+   forget に切替、ただし最初は await で素直に)。
 
-#### New DO: `IssueSubsDO`
+#### 新 DO: `IssueSubsDO`
 
-Keyed by `subs:${owner}/${repo}#${number}` via `idFromName`. Storage:
+`subs:${owner}/${repo}#${number}` を `idFromName` のキーにする。
+Storage:
 
 ```
 sub:${github_login}    →    { added_at: <epoch>, last_event_at: <epoch | null> }
 ```
 
-`fetch` handler routes:
+`fetch` ハンドラの route:
 
 | Path | Method | Body | Returns |
 |---|---|---|---|
 | `/__add` | POST | `{ github_login }` | `{ ok: true, count }` |
 | `/__remove` | POST | `{ github_login }` | `{ ok: true, count }` |
 | `/__list` | GET | — | `{ subscribers: string[] }` |
-| `/__clear` | DELETE | — | `{ ok: true }` (cleanup only) |
+| `/__clear` | DELETE | — | `{ ok: true }` (cleanup のみ) |
 
-Empty DO instance is fine; it costs nothing until first write.
-Cold-start ~10 ms is acceptable for webhook delivery.
+空 instance のままで OK (初回 write までコスト無)。cold-start ~10 ms
+は webhook 配信用途として許容範囲。
 
-#### `McpSession` DO extension
+#### `McpSession` DO への追加
 
-Existing `McpSession` (per `github_login`) gains one route:
+既存の `McpSession` (per `github_login`) に 1 route 追加:
 
 | Path | Method | Body |
 |---|---|---|
@@ -611,18 +609,18 @@ Existing `McpSession` (per `github_login`) gains one route:
 
 Handler:
 
-1. If a `client`-tagged WebSocket is currently attached, build the new
-   `event` frame (see below) and `ws.send(JSON.stringify(frame))`.
-2. If no WebSocket attached (session hibernating), persist to storage
-   prefix `pending_event:${delivery_id}`. Replay on next `client`
-   reconnect via existing `webSocketAccept` codepath, then delete.
-3. Respond `{ delivered: true | "buffered" }`.
+1. `client` タグ付きの WebSocket が現在接続中なら、新 `event` frame
+   を組み立てて `ws.send(JSON.stringify(frame))`。
+2. WebSocket 未接続 (session hibernating) なら storage に
+   `pending_event:${delivery_id}` で永続化。次回 `client` 再接続時
+   (既存の `webSocketAccept` 経路) で replay し、delete。
+3. レスポンス: `{ delivered: true | "buffered" }`。
 
-Pending events have a TTL (e.g. 72 h) to prevent unbounded growth.
+`pending_event:*` には TTL (例 72 h) を設定し、無制限に貯まるのを防ぐ。
 
-#### New WebSocket frame variant
+#### 新 WebSocket frame variant
 
-Extends the JSON-RPC-style envelope used today by `req` / `resp`:
+既存の `req` / `resp` と同じ JSON-RPC 風 envelope に変種を追加:
 
 ```json
 {
@@ -637,7 +635,7 @@ Extends the JSON-RPC-style envelope used today by `req` / `resp`:
     "comment": {
       "id": 4458750334,
       "user": { "login": "yhonda-ohishi" },
-      "body": "<truncated to 4 KB>",
+      "body": "<4 KB で truncate>",
       "html_url": "https://github.com/ippoan/cc-relay/issues/42#issuecomment-..."
     },
     "issue": { "title": "...", "state": "open", "labels": [...] }
@@ -645,18 +643,17 @@ Extends the JSON-RPC-style envelope used today by `req` / `resp`:
 }
 ```
 
-`v` is the schema version; bump on breaking changes. `payload` is a
-**subset** — only fields needed to render a notification preview.
-Full data reachable via `api.github.com` (the binary holds a GitHub
-token already).
+`v` は schema version、breaking change で bump。`payload` は
+**subset**:notification preview に必要な field のみ。フルデータは
+`api.github.com` で再取得可 (binary が GitHub token を持っている)。
 
-Frame size budget: target < 8 KB per delivery. Truncate `body` /
-`labels[]` if exceeded.
+frame size 目安: 1 配信 8 KB 未満。超えたら `body` / `labels[]` を
+truncate。
 
-#### cc-relay MCP tools
+#### cc-relay 側 MCP tools
 
-Added to `crates/agent-mcp/src/lib.rs` next to the existing
-`notify_agent` / `get_inbox` family:
+`crates/agent-mcp/src/lib.rs` に既存の `notify_agent` / `get_inbox`
+ファミリに並べて追加:
 
 ```rust
 #[tool(description = "Subscribe this session to GitHub activity on an \
@@ -680,109 +677,106 @@ async fn unsubscribe_issue_activity(
 ) -> ToolResult { ... }
 ```
 
-Both tools issue a JSON-RPC bridge call through the existing WS to
-auth-worker, which performs:
+両 tool は既存 WS を通じて auth-worker に JSON-RPC bridge call:
 
-1. JWT verify → extract `github_login`.
-2. `IssueSubsDO(`subs:${owner}/${repo}#${number}`).fetch('/__add')`.
-3. Optionally record a back-reference in the caller's `McpSession`
-   storage under `gh_sub:${owner}/${repo}#${number}` for state
-   inspection (`get_inbox`-style introspection later).
+1. auth-worker 側で JWT 検証 → `github_login` を抽出。
+2. `IssueSubsDO(`subs:${owner}/${repo}#${number}`).fetch('/__add')` を call。
+3. 副次的に caller の `McpSession` storage に
+   `gh_sub:${owner}/${repo}#${number}` で back-reference を書く
+   (`get_inbox` 系の introspection に使う用、後の ADR で活用)。
 
-`unsubscribe` mirrors with `/__remove`.
+`unsubscribe` は `/__remove` で対称。
 
-#### Receiving the event frame in cc-relay
+#### cc-relay 側で event frame を受ける
 
-In `crates/agent-mcp/src/relay.rs`, the frame dispatcher gains a
-match arm for `kind == "event"`:
+`crates/agent-mcp/src/relay.rs` の frame dispatcher に `kind == "event"`
+の match arm を追加:
 
-1. Wrap payload in a `<github-webhook-activity>...</github-webhook-activity>`
-   envelope (same shape as `subscribe_pr_activity` events for muscle-memory
-   compat).
-2. Emit via rmcp's `notifications/message` channel (server-initiated
-   notification on the active stdio MCP transport).
-3. The Claude Code session receives this as a wake-up message and acts
-   on it in the next turn.
+1. payload を
+   `<github-webhook-activity>...</github-webhook-activity>` envelope
+   で包む (`subscribe_pr_activity` event と同形にして muscle-memory 互換)。
+2. rmcp の `notifications/message` channel (server-initiated notification、
+   現 stdio MCP transport) で発火。
+3. Claude Code session 側はこれを wake-up message として受信し、次 turn
+   で処理する。
 
-#### GitHub webhook configuration
+#### GitHub webhook 設定
 
-Per repo:
+repo ごとに:
 
 - Settings → Webhooks → Add webhook
 - Payload URL: `https://mcp.ippoan.org/webhooks/github`
 - Content type: `application/json`
-- Secret: same value as `auth-worker` env `GITHUB_WEBHOOK_SECRET`
-- Events: **Issues** + **Issue comments** (not "Send me everything")
+- Secret: `auth-worker` env `GITHUB_WEBHOOK_SECRET` と同じ値
+- Events: **Issues** + **Issue comments** (`Send me everything` ではなく個別選択)
 - Active: ✓
 
-One-time per repo. Could be automated via Octokit (write a
-`scripts/install-webhook.sh`) in a future ADR.
+repo 1 個に対して 1 回だけ。Octokit で自動化 (`scripts/install-webhook.sh`)
+する余地あるが本 ADR 範囲外、follow-up で。
 
 ### Consequences
 
-#### Positive
+#### 良くなる点
 
-- Real-time push for issue events, end-to-end latency target 1–2 s.
-- **Survives CCoW container standby** because the queue lives on
-  `auth-worker` (Cloudflare Workers + DO storage), not in the
-  hibernate-prone host container.
-- Subscription state persists across session restarts (DO storage).
-- Same conceptual model as `subscribe_pr_activity` (idempotent
-  subscribe, frames arrive as `<github-webhook-activity>`), so prompts
-  and skills written for the PR case work for issues with minimal
-  change.
-- No KV, no D1 — pure DO. Single source of truth, strongly consistent.
+- issue event の real-time push が可能、end-to-end 遅延 1–2 秒目標。
+- **CCoW container standby を生き残る**。queue が `auth-worker`
+  (Cloudflare Workers + DO storage) 側にあるため、hibernate しがち
+  な host container には依存しない。
+- subscription state は DO storage で session 再起動を越えて永続。
+- `subscribe_pr_activity` と同じ conceptual model (idempotent
+  subscribe、frame は `<github-webhook-activity>` で到着) なので、PR
+  用に書いた prompt / skill が issue 版にもほぼそのまま流用できる。
+- KV も D1 も使わない。**pure DO**、single source of truth、strongly
+  consistent。
 
-#### Negative / open
+#### 悪化する点 / 未解決
 
-- Adds one new DO class (`IssueSubsDO`). Operational surface grows.
-- Each repo needs the GitHub webhook configured once. Friction on
-  onboarding new repos; offset by `scripts/install-webhook.sh` (out of
-  scope here, follow-up).
-- GitHub webhook retry semantics (3 attempts over ~30 min on
-  non-2xx). If `auth-worker` is down longer, events are lost.
-  Mitigation: keep `auth-worker` health-checked; consider replay endpoint
-  later.
-- DO cold start adds ~10 ms to webhook delivery on inactive
-  `(owner/repo#N)` pairs. Acceptable.
+- 新 DO class (`IssueSubsDO`) が増える。運用 surface 増。
+- 新 repo の onboarding ごとに GitHub webhook 設定が必要。摩擦は
+  `scripts/install-webhook.sh` (本 ADR 範囲外、follow-up) で吸収予定。
+- GitHub webhook retry は 3 回 / 約 30 分。`auth-worker` がそれ以上
+  落ちると event を取りこぼす。mitigation: health-check を維持、
+  必要なら replay endpoint を後追いで用意。
+- 非活性な `(owner/repo#N)` 組み合わせには DO cold start ~10 ms が
+  乗る。webhook 配信には許容範囲。
 
 ### Alternatives considered (rejected)
 
-| Alternative | Why rejected |
+| Alternative | 却下理由 |
 |---|---|
-| In-process polling in `rust-mcp-agent` | Dies on CCoW standby; cursor-based replay needs an external wake signal which only true webhook delivery provides. |
-| PR-per-task (`subscribe_pr_activity`) | Works but creates empty PRs for non-code tasks. Acceptable stopgap, wrong long-term shape for "issue-as-broker". |
-| KV reverse index `(owner/repo#N) → [github_login...]` | Eventual consistency complicates subscribe/unsubscribe races; adds non-zero $-cost; DO `idFromName` routing gives strong consistency for free. |
-| Dedicated `WebhookLogDO` for debug | Phase B can use `console.log` to Worker logs; an extra DO class for transient debug data is overkill. Dropped from the design. |
+| `rust-mcp-agent` 内 in-process polling | CCoW standby で死ぬ。cursor-based replay には外部 wake signal が要るが、その signal を出せるのは server-side webhook 配信だけ。 |
+| PR-per-task (`subscribe_pr_activity` 流用) | 動作するが、コード変更のない task に empty PR が貯まる。繋ぎとしては OK、long-term の「issue-as-broker」形ではない。 |
+| KV による reverse index `(owner/repo#N) → [github_login...]` | eventual consistency で subscribe/unsubscribe race が複雑化、$-cost も非ゼロ。DO `idFromName` routing が strongly consistent で同等機能を提供。 |
+| debug 用 `WebhookLogDO` を切る | Phase B では `console.log` で Worker logs に流せば足りる。transient debug data 用に DO class を 1 個増やすのは over-engineering。設計から削除。 |
 
-### Validation (must pass before Status: Accepted)
+### Validation (Status: Accepted に flip する前に通すこと)
 
-1. `POST /webhooks/github` with a valid signature → 200; payload
-   parsed; matching `IssueSubsDO` invoked. Unit test with mock
-   delivery.
-2. `POST /webhooks/github` with invalid signature → 401, no DO call.
-3. `IssueSubsDO` add → list → remove → list lifecycle, including
-   the empty case after remove.
-4. `McpSession.push_event` delivers a frame when the WS is attached;
-   buffers under `pending_event:` when not, and replays on reconnect.
-5. **End-to-end staging acceptance** on `ippoan/cc-relay#<test-issue>`:
-   - rust-mcp-agent session calls `subscribe_issue_activity` →
-     IssueSubsDO has 1 subscriber.
-   - Operator posts a comment from the browser.
-   - WS frame `{"kind":"event",...}` arrives at the binary within 5 s.
-   - Claude session receives `<github-webhook-activity>` notification.
-6. Hibernation test: subscribe → close CCoW session → wait for
-   container reclaim → post comment → resume session → buffered frame
-   is delivered as part of the first WS reconnect.
+1. `POST /webhooks/github` に valid signature → 200、payload parse、
+   該当 `IssueSubsDO` が呼ばれる。mock delivery で unit test。
+2. `POST /webhooks/github` に invalid signature → 401、DO call なし。
+3. `IssueSubsDO` の add → list → remove → list lifecycle、remove 後の
+   空状態も含む。
+4. `McpSession.push_event`: WS 接続中なら frame 配信、未接続なら
+   `pending_event:` に buffer、reconnect 時に replay。
+5. **staging end-to-end 受け入れテスト** (`ippoan/cc-relay#<test-issue>`):
+   - rust-mcp-agent session が `subscribe_issue_activity` を call →
+     IssueSubsDO に subscriber 1 件。
+   - operator が browser から comment 投稿。
+   - 5 秒以内に binary 側で WS frame `{"kind":"event",...}` 到着。
+   - Claude session が `<github-webhook-activity>` notification を受信。
+6. hibernation test: subscribe → CCoW session 閉じる → container
+   reclaim 待ち → comment 投稿 → session 再開 → 再接続時の最初の WS
+   message 列に buffer 済 frame が含まれている。
 
 ### Phase mapping
 
 | Phase | Repo | Scope |
 |-------|------|-------|
-| **A** | `cc-relay`    | This ADR merged (current PR). |
-| **B** | `auth-worker` | `POST /webhooks/github` route + HMAC verify + `console.log` debug. No DO yet, just confirm GitHub posts arrive and signature validates. |
-| **C** | `auth-worker` | `IssueSubsDO` class + RPCs (`/__add` `/__remove` `/__list`). `McpSession` `/__push_event` + buffered `pending_event:` replay. End-to-end fan-out from webhook. |
-| **D** | `cc-relay`    | `subscribe_issue_activity` / `unsubscribe_issue_activity` MCP tools. `agent-mcp/src/relay.rs` frame dispatcher gains `kind: "event"` arm + `<github-webhook-activity>` emit. |
-| **E** | `ippoan/cc-relay` (config) | Repo webhook configured (one-time). Integration test issue (`cc-relay#agent-protocol-test` or similar) used for §Validation step 5. |
-| **F** | both          | Flip ADR-004 Status to Accepted. `docs/agent-task-protocol.md` cookbook for how a parent session orchestrates worker sessions through issues + this tool. |
+| **A** | `cc-relay`    | 本 ADR merge (本 PR)。 |
+| **B** | `auth-worker` | `POST /webhooks/github` route + HMAC verify + `console.log` debug。DO はまだ追加せず、GitHub からの POST が届いて signature が通ることだけ確認。 |
+| **C** | `auth-worker` | `IssueSubsDO` class + `/__add` `/__remove` `/__list` RPC。`McpSession` `/__push_event` + `pending_event:` buffer + reconnect 時 replay。webhook → fan-out まで end-to-end で繋ぐ。 |
+| **D** | `cc-relay`    | `subscribe_issue_activity` / `unsubscribe_issue_activity` MCP tool 追加。`agent-mcp/src/relay.rs` frame dispatcher に `kind: "event"` arm + `<github-webhook-activity>` envelope 生成。 |
+| **E** | `ippoan/cc-relay` (config) | repo webhook を設定 (1 回)。検証用 issue (`cc-relay#agent-protocol-test` など) を作って §Validation step 5 を実施。 |
+| **F** | both          | ADR-004 Status を Accepted に flip。`docs/agent-task-protocol.md` に「親 session が worker session を issue + 本 tool で oriケスト レーションする」cookbook を追加。 |
+
 
