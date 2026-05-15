@@ -470,7 +470,9 @@ the JWT's `github_login` claim closes the gap and lets the same
 
 ## ADR-004: GitHub issue activity webhooks via existing MCP relay WS (multiplex)
 
-**Status:** Proposed (2026-05-15)。「みて」手動 polling を廃止する。
+**Status:** Accepted (2026-05-15)。「みて」手動 polling を廃止する。
+Phase A–F まで実機検証済 (#44 / #47 / #138 / #46)。後続の Phase D 強化
+(SSE notification back-pipe) は #47 で merged。
 
 > **本 ADR は 2 度書き直されている。最終形は「既存 MCP WS で multiplex
 > + client side filter」**。経緯は #Context 末尾と
@@ -849,9 +851,380 @@ repo 1 個に対して 1 回。Octokit 自動化スクリプト (`scripts/instal
 | **A** | `cc-relay` | 本 ADR の amend (multiplex 設計に最終形) | 本 PR |
 | **B** | `auth-worker` | `POST /webhooks/github` route + HMAC verify、`McpSession.handlePushEvent` route 追加、`payload.repository.owner.login` routing。 | ✅ #138 merged (#137 の per-issue WS 案を rollback したもの) |
 | **C** | `cc-relay` | `subscribe_issue_activity` / `unsubscribe_issue_activity` / `get_issue_events` / `list_watched_issues` MCP tool 追加。`watched-issues.txt` + `issue-events.jsonl` の file ops。frame dispatcher に `kind:"event"` arm。 | ✅ #44 merged |
-| **D** | both | (real-time wake-up) auth-worker `/mcp` の Streamable HTTP / SSE 対応、binary 側で event 受信時に MCP `notifications/message` で Claude session へ push。 | TODO |
-| **E** | `cc-relay` | SessionStart 復帰 + CursorStore catchup (取りこぼし救済) | TODO |
-| **F** | `ippoan/cc-relay` (config) | repo webhook を設定 (1 回)。検証用 issue を作って §Validation step 5 を実施。 | TODO |
-| **G** | both | ADR-004 Status を Accepted に flip。`docs/agent-task-protocol.md` cookbook 追加。 | TODO |
+| **D** | both | (real-time wake-up) auth-worker `/mcp` の Streamable HTTP / SSE 対応、binary 側で event 受信時に MCP `notifications/message` で Claude session へ push。 | ✅ #47 merged |
+| **E** | `cc-relay` | SessionStart 復帰 + CursorStore catchup (取りこぼし救済) | ✅ ADR-006 経路 (auth-worker#140) に統合、cc-relay 側は claude-hooks#9 で SessionStart hook が drain instruction を inject |
+| **F** | `ippoan/cc-relay` (config) | repo webhook を設定 (1 回)。検証用 issue を作って §Validation step 5 を実施。 | ✅ #46 close 時に staging E2E 確認済 |
+| **G** | both | ADR-004 Status を Accepted に flip。`ARCHITECTURE.md` に ADR-005 / ADR-006 / CCoW cookbook 追加 (本コミット #49)。 | ✅ #49 |
 
+
+
+---
+
+## ADR-005: Claude Code Channel — stdio MCP server で session に push する出力経路
+
+**Status:** Accepted (2026-05-15)。`crates/agent-mcp/src/channel.rs` で実装、
+`rust-mcp-agent channel` subcommand として shipped (PR #48)。
+
+### Context
+
+ADR-004 で webhook event を WS frame として cc-relay binary に届ける経路は
+できた。問題は **その先 — binary が Claude session に対して event を
+push する手段** がない点だった。
+
+`rust-mcp-agent relay` mode は Streamable HTTP over WS のリクエスト/レスポンス
+(`Frame::Req` / `Frame::Resp`) しか喋らないので、server-initiated な
+notification を session に届ける口が無い。`get_issue_events` で操作者が
+能動的に drain する形は動くが、
+
+- 受動 channel が無いので Claude が「webhook が来た」事実を turn 内で
+  知る手段が無い
+- 結局 operator が「みて」と打つ polling 形になり、ADR-004 が目指した
+  自動化が完成しない
+
+Claude Code は [Channels Reference] で **`notifications/claude/channel`
+JSON-RPC notification を stdio MCP server から受けると `<channel source=...>`
+envelope として user turn に inject する** 機構を提供している
+([code.claude.com/docs/en/channels-reference][Channels Reference])。
+これを使えば binary → Claude session の push が成立する。
+
+[Channels Reference]: https://code.claude.com/docs/en/channels-reference
+
+### Decision
+
+`rust-mcp-agent channel` mode を追加 (`crates/agent-mcp/src/channel.rs`):
+
+1. **Transport**: stdio (`spawn` される subprocess、Claude Code 標準)
+2. **Capability**: `initialize` response に
+   `capabilities.experimental["claude/channel"] = {}` を返し、Claude Code
+   側に「このサーバーは channel 経路を持つ」と申告
+3. **Inbound (req/resp)**: 通常の MCP `tools/list` / `tools/call` を stdio
+   越しに受ける (relay mode と同じ `RelayServer` dispatcher を共有)
+4. **Outbound (event push)**:
+   - 同時に **auth-worker への outbound WS を 1 本張る** (relay mode と同じ
+     wire / 同じ JWT)
+   - `kind:"event"` frame を受信したら、`notifications/claude/channel` の
+     JSON-RPC notification を 1 行で stdout に書く
+   - Claude Code がそれを line-by-line に読み取り、`<channel source="cc-relay"
+     issue_number="..." delivery_id="...">payload</channel>` 形式で
+     **次の user turn に inject** する
+5. **stdout race 防止**: JSON-RPC response (tools/call の返り値) と
+   notification が同じ stdout に出るので、`mpsc::UnboundedSender<String>` で
+   1 本の writer task に集約する
+
+### Consequences
+
+- ✅ session が hot な間は **operator 操作なしで** webhook event が
+  Claude turn に流れる (ADR-004 が目指した自動化の完成)
+- ✅ relay mode と server side (auth-worker DO) を共有しているので
+  auth-worker 側に追加実装不要
+- ⚠️ stdio subprocess は Claude Code が host である必要 — Claude.ai
+  (web) や Claude Code on the Web (CCoW) のような connector 経路では
+  使えない (`POST /mcp` しか喋らない)。CCoW では ADR-006 経路を使う
+- ⚠️ subprocess が落ちると channel が切れる。再起動は Claude Code が
+  MCP server 設定に従って自動 spawn する
+- ⚠️ 旧 ADR-005 案 (`notifications/claude/channel` を CCoW connector が
+  受ける) は **存在しない** — connector はこの notification を session に
+  届けない。ADR-005 は **stdio 限定**であることを明記する
+
+### Validation
+
+- `agent-mcp/tests/channel_integration.rs` (or stub) で
+  `initialize` 応答に `experimental["claude/channel"]` が乗ること
+- mock WS から `event` frame 投げて stdout に
+  `notifications/claude/channel` が出ることを文字列マッチで確認
+- staging で実機: Claude Code (CLI) から `rust-mcp-agent channel` を
+  起動 → GitHub webhook 発火 → 次 user turn の context に `<channel
+  source="cc-relay" ...>` が現れること
+
+### Phase mapping
+
+| Phase | Scope | 状態 |
+|---|---|---|
+| **A** | stdio + outbound WS + channel capability + notification emit | ✅ #48 merged |
+| **B** | meta filter (subscription) + de-dup by `delivery_id` | TODO |
+| **C** | reconnect / JWT refresh tightening | TODO |
+
+
+---
+
+## ADR-006: Server-side subscription + CCoW polling drain
+
+**Status:** Accepted (2026-05-15)。`auth-worker/src/durable_objects/mcp-session-do.ts`
+で実装 (auth-worker#140)、organization repo mapping は auth-worker#141 で
+追加、staging E2E 実機検証済 (cc-relay#46 close 時点)。
+
+### Context
+
+ADR-004 (binary 経路) + ADR-005 (Claude Code stdio channel) は
+**binary subprocess が起動できる環境** で動く。だが Claude Code on the Web
+(CCoW) は
+
+- subprocess を spawn できない (sandbox)
+- MCP は `POST /mcp` (Streamable HTTP) connector 経由のみ
+- session container は inactivity で hibernate / 再 spawn される — 動いて
+  いない時間が webhook 到着と被ると event を取りこぼす
+
+つまり CCoW で ADR-004 を使いたければ、**server 側に event を貯めて
+session が次に turn を回した時に drain する経路**が要る。
+
+### Decision
+
+`McpSession` Durable Object に **subscription set + event queue** を持たせ、
+inline stub MCP server に 4 つの tool を追加する:
+
+| Tool | 動作 |
+|---|---|
+| `subscribe_issue_activity(owner, repo, issue_number)` | DO storage `subs` set に `owner/repo#N` を append (idempotent) |
+| `unsubscribe_issue_activity(owner, repo, issue_number)` | `subs` set から remove |
+| `list_watched_issues()` | 現在の `subs` set を返す |
+| `get_pending_events()` | `events` queue を drain (read + clear)、event の配列を **JSON 文字列** で返す |
+
+webhook handler 側 (`handlePushEvent`) は ADR-004 の WS broadcast と並行して
+**subscription filter を通った event を `events` queue に append** する
+(`queueEventIfSubscribed`)。queue は FIFO、上限 `MAX_QUEUED_EVENTS = 500`
+で drop-oldest policy。
+
+```
+POST /webhooks/github
+        │
+        ▼
+[handleGithubWebhook]
+        │ X-Hub-Signature-256 verify
+        │ owner mapping (gh_org:<owner> → github_login)
+        ▼
+[McpSession DO #idFromName(github_login)]
+        ├─▶ /__push_event → WS broadcast (ADR-004 経路)
+        ├─▶ SSE channel push (ADR-004 Phase D)
+        └─▶ queueEventIfSubscribed (本 ADR)
+                  │ if subs has owner/repo#N:
+                  │   events.push(eventBody)
+                  │   while events.length > 500: events.shift()
+                  └─ DO storage put "events"
+
+CCoW session next turn:
+   tools/call get_pending_events → DO returns JSON.stringify(events)
+   → DO clears storage.events
+   → Claude が JSON.parse して payload を読む
+```
+
+#### organization repo の routing
+
+個人 repo は webhook の `payload.repository.owner.login == github_login` で
+自然に DO に届く。organization repo は owner = org 名で github_login と
+ズレるため、`AUTH_CONFIG` KV に `gh_org:<org> = <github_login>` mapping を
+持って resolve する (auth-worker#141):
+
+```bash
+# 例: ippoan org のすべての webhook を yhonda-ohishi の DO に送る
+wrangler kv key put --remote --binding=AUTH_CONFIG --env staging \
+  gh_org:ippoan yhonda-ohishi
+```
+
+mapping が無ければ owner をそのまま使う (= 既存挙動)。
+
+### Consequences
+
+- ✅ CCoW でも webhook event が拾える (binary なし)
+- ✅ ADR-004 binary 経路と共存 — 同じ event が両経路に流れて Claude 側で
+  `delivery_id` de-dup する想定。drop-oldest cap 500 は通常運用で十分
+- ⚠️ `get_pending_events` の返り値は **MCP `content` 1 個の JSON 文字列**
+  で配列ではない (MCP spec の制約)。消費側は `JSON.parse` してから配列を
+  扱う必要がある
+- ⚠️ at-most-once delivery — drain 中に DO が落ちると event lost。次 ADR で
+  cursor-based replay にする余地あり (現状は drop で割り切り)
+- ⚠️ queue 上限 500 を超える長期 hibernation では event 欠落する。
+  `delivery_id` の連番 gap で操作者が検知して GitHub Webhook Replay で
+  再送する運用
+- ⚠️ subscription state は DO 単位 (per github_login)。同じ user が複数
+  CCoW session を持つと subscribe/unsubscribe が共有される — 通常は意図通り
+
+### Validation
+
+- `auth-worker/test/durable_objects/mcp-session-do.test.ts` の
+  `"McpSession inline stub — ADR-006 server-side tools"` describe block
+  が 5 tools (`ping` + 4 ADR-006 tools) を網羅
+- `test/handlers/github-webhook.test.ts` の `"ADR-006: routes org-owned
+  repo to mapped github_login"` 等で org mapping 動作を確認
+- staging 実機 (cc-relay#46 close 時点):
+  - CCoW session が `subscribe_issue_activity(ippoan, cc-relay, 50)` 発火
+  - browser から #50 にコメント投稿
+  - 次 turn で `get_pending_events()` 呼ぶ → 配列に 1 event、`delivery_id`
+    も entity body も揃って取得
+  - 2 度目の `get_pending_events()` は空配列 (drain after read)
+
+### Phase mapping
+
+| Phase | Repo | Scope | 状態 |
+|---|---|---|---|
+| **A** | `auth-worker` | DO storage subs/events、4 tools、handlePushEvent から queue 連携、上限 500 drop-oldest | ✅ auth-worker#140 |
+| **B** | `auth-worker` | org repo mapping (`gh_org:<owner>` KV lookup) | ✅ auth-worker#141 |
+| **C** | docs (this ADR) | ARCHITECTURE.md に文書化、CCoW cookbook 追加 | ✅ #49 (本コミット) |
+| **D** | (future) | cursor-based replay (at-least-once)、subscription per-session 化 | TODO |
+
+
+---
+
+## CCoW cookbook: webhook event を Claude session に流す (ADR-006 経路)
+
+CCoW (Claude Code on the Web) で GitHub webhook event を消費する手順。
+
+binary subprocess が動かない環境で、**ADR-006 server-side queue だけで**
+完結する最小レシピ。
+
+### 1. MCP server を attach する
+
+CCoW プロジェクトの `.mcp.json` (or `~/.claude/mcp_servers.json`) で
+auth-worker の `/u/<login>/mcp` を `streamable-http` transport で attach:
+
+```jsonc
+{
+  "mcpServers": {
+    "cc-relay": {
+      "type": "streamable-http",
+      "url": "https://mcp-staging.ippoan.org/u/yhonda-ohishi/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_JWT>"
+      }
+    }
+  }
+}
+```
+
+JWT は `rust-mcp-agent auth` で 1 度発行 (`~/.cc-relay/token`)。`<login>`
+は GitHub login。
+
+### 2. organization repo の場合 — `gh_org` mapping を登録
+
+ippoan/cc-relay のように owner が org の repo を subscribe する場合、
+webhook の routing 先 (owner) と JWT 所有者 (github_login) が一致しない。
+mapping を 1 度だけ KV に書く:
+
+```bash
+wrangler kv key put --remote --binding=AUTH_CONFIG --env staging \
+  gh_org:ippoan yhonda-ohishi
+```
+
+これで `ippoan/*` の webhook は `yhonda-ohishi` の `McpSession` DO に
+routing される。
+
+### 3. subscribe → コメント投稿 → drain
+
+Claude session 内で:
+
+```text
+mcp__cc_relay__subscribe_issue_activity(owner="ippoan", repo="cc-relay", issue_number=50)
+```
+
+別ブラウザ tab から該当 issue にコメントを投稿。次の turn 開始時に
+Claude が:
+
+```text
+mcp__cc_relay__get_pending_events()
+```
+
+を call すると DO の queue が drain される。返り値は **JSON 文字列の配列**
+(MCP `content` 1 個):
+
+```json
+"[{\"event_type\":\"issue_comment.created\",\"delivery_id\":\"abc-123\",\"owner\":\"ippoan\",\"repo\":\"cc-relay\",\"issue_number\":50,\"received_at\":\"2026-05-15T16:00:00Z\",\"payload\":{...}}]"
+```
+
+→ `JSON.parse` して配列にしてから `event_type` / `payload.comment.body`
+等を読む。
+
+### 4. SessionStart hook と組み合わせる (推奨)
+
+毎セッション開始時に自動 drain したい場合は
+[yhonda-ohishi/claude-hooks#9](https://github.com/yhonda-ohishi/claude-hooks/pull/9)
+の `session-start-cc-relay-wss.sh` + `user-prompt-submit-cc-relay-events.sh`
+を使う:
+
+- SessionStart で `additionalContext` に「`list_watched_issues` →
+  `get_pending_events` を呼んで」という指示を inject
+- `delivery_id` を `~/.cc-relay/seen-deliveries.json` (24h TTL) で記録、
+  WS probe 経路と queue drain 経路の重複を排除
+
+### 5. Troubleshooting
+
+| 症状 | 原因 / 対処 |
+|---|---|
+| `get_pending_events` が常に空配列 | (a) subscription 不在 — `list_watched_issues` で確認 (b) webhook が auth-worker まで届いていない — repo webhook delivery 画面で `200` を確認 (c) org mapping 未登録 — Step 2 |
+| 返り値が配列でなく string | 正常。MCP `content` の制約で string 1 個。`JSON.parse` してから扱う |
+| event が大量に貯まって古いものが消える | drop-oldest cap 500 を踏んだ。GitHub Webhook Replay で再送 (delivery_id 連番 gap で検出) |
+| `delivery_id` 重複 event | binary 経路 (ADR-004) と queue 経路 (本 ADR) で同じ event が届く設計。`delivery_id` で de-dup する |
+
+
+---
+
+## WSS `/connect` の用途と CCoW から見た制約 (cc-relay#50)
+
+`wss://mcp(-staging).ippoan.org/[u/<login>/]connect` は **binary 専用** の
+outbound WebSocket endpoint。CCoW Claude session **自身がこの WS を喋る
+ことはない**。
+
+### wire format
+
+`auth-worker/src/durable_objects/mcp-session-do.ts handleConnect`:
+
+- 認証: MCP Bearer JWT (`Authorization` header on Upgrade)
+- accept 後の wire は **MCP protocol ではなく cc-relay 独自の Frame v1**:
+  `{kind:"req"|"resp"|"event"|"notif"|"hello", v:1, ...}` (base64 body)
+- 元々は `rust-mcp-agent` binary が outbound に張る前提。Claude.ai /
+  CCoW connector はこの protocol を喋らない (し、binary を CCoW で
+  起動する手段も無い)
+
+### CCoW container と WSS
+
+実測 (2026-05-15): CCoW container の egress は **WSS は通す** ことが
+判明している:
+
+- `wss://mcp-staging.ippoan.org/u/<owner>/connect` への HTTP/1.1 Upgrade
+  試行で `401 Unauthorized` (auth 要求) まで進む → エッジ到達 + worker 応答
+- 旧 PoC の「WSS /connect 403」は古い allowlist (現在は閉じてない)
+
+つまり「WS が通る」事と「polling を撤廃できる」事の間には、まだ
+**transport の用途** という gap がある。WSS が通ることだけでは Claude
+session を wake させる経路にはならない。
+
+### 3 つの path と現状
+
+| Path | Status | 用途 |
+|---|---|---|
+| **A. Binary outbound WS** (binary `relay` / `channel`) | ✅ Shipped (ADR-004, ADR-005) | binary を起動できる環境 (CLI / 一部 hook) — event を frame で受けて MCP notification に変換 |
+| **B. CCoW から WSS probe を立てる** (claude-hooks#9 の `session-start-cc-relay-wss.sh`) | ✅ Shipped — Phase A PoC | CCoW container 内で `rust-mcp-agent probe` を background launch し、frame を JSONL log に append。UserPromptSubmit hook で差分を session に inject。**turn 内**の long-poll を解消するが、**hibernation 中**の event は queue drain (Path C) が必要 |
+| **C. ADR-006 polling drain** | ✅ Shipped (本 ADR) | CCoW session resume 時の取りこぼし救済。binary 不要 |
+
+### CCoW から見た制約
+
+1. **Claude session を外部 event で wake する経路は存在しない**。Claude
+   session は user message か tool result からのみ turn を開始する。WSS
+   が通っても server-initiated push を session に届ける路が無い。
+2. CCoW container は hibernate / 再 spawn されるので、長期 WS は保てない。
+   Path B の probe も session が止まれば一緒に止まる → Path C で穴埋め。
+3. binary は CCoW container 内では token 不在 (CCoW は `~/.cc-relay/token`
+   を seed しない) なので、`rust-mcp-agent auth` で 1 度発行する。
+
+### B 案 (将来): WSS /connect を MCP Streamable HTTP の WS variant 化
+
+MCP spec の Streamable HTTP transport には **WebSocket variant** も認め
+られている。`/u/<login>/connect` の wire を **MCP JSON-RPC over WebSocket**
+に変更/追加すれば、Anthropic Claude.ai connector が将来 WS variant を
+喋るようになった時に polling 撤廃の path B 統合が成立する。
+
+ただし 2026-05 時点で:
+
+- Anthropic Claude.ai MCP connector spec は `POST /mcp` 専用 (WS variant
+  未対応)
+- SEP-1287 (WS push spec) は 2025-12-03 に closed されたので当面棚上げ
+
+→ **B 案は当面棚上げ**、Path A + Path C で運用継続。
+
+### 参考
+
+- ADR-004 (binary 経路 + SSE notification back-pipe)
+- ADR-005 (Claude Code Channel — stdio 限定)
+- ADR-006 (server-side queue — CCoW)
+- yhonda-ohishi/claude-hooks#8 (probe + UserPromptSubmit hook 設計)
+- yhonda-ohishi/claude-hooks#9 (probe + UserPromptSubmit hook 実装)
+- ippoan/cc-relay#50 (本 section の親 issue)
 
