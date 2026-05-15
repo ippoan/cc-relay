@@ -60,6 +60,18 @@ const FRAME_VERSION: u32 = 1;
 const SERVER_NAME: &str = "cc-relay";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// ADR-005: instructions added to Claude's system prompt when running as a
+/// Channel. Tells Claude how to recognize the `<channel>` tag emitted by
+/// `notifications/claude/channel`, what the meta-derived attributes mean,
+/// and that events are one-way (no reply tool wired in Phase A).
+const CHANNEL_INSTRUCTIONS: &str = "GitHub webhook events arrive as \
+    `<channel source=\"cc-relay\" event_type=\"...\" owner=\"...\" repo=\"...\" \
+    issue_number=\"...\" delivery_id=\"...\">...</channel>` envelopes. \
+    `event_type` is e.g. `issue_comment.created` / `issues.opened`. The body \
+    is the raw GitHub event JSON (truncated). The events are one-way: read \
+    them and act, no reply expected. Filter is done client-side via the \
+    `subscribe_issue_activity` / `unsubscribe_issue_activity` tools.";
+
 /// Outbound `hello` frame (us → DO) sent immediately after WS upgrade.
 #[derive(Debug, Clone, Serialize)]
 struct HelloFrame {
@@ -116,6 +128,16 @@ pub struct RelayServer {
     /// wrapping a JSON-RPC `notifications/message` so the auth-worker DO can
     /// fan it out to attached SSE channels. `None` in tests (no real WS).
     notif_tx: Option<mpsc::UnboundedSender<String>>,
+    /// ADR-005 Phase A: when set, the server runs as a Claude Code Channel
+    /// (`claude/channel` experimental capability) over **stdio** rather than
+    /// as a WS frame relay. In this mode:
+    ///   - `initialize` advertises `experimental: { "claude/channel": {} }`
+    ///     + `instructions` so Claude knows how to read the `<channel>` tag.
+    ///   - `handle_event_frame` formats each event as a JSON-RPC
+    ///     `notifications/claude/channel` notification (with `content` /
+    ///     `meta` params) and pushes it to `notif_tx`. The stdio writer
+    ///     task drains the channel and writes raw JSON-RPC lines to stdout.
+    channel_mode: bool,
 }
 
 impl RelayServer {
@@ -142,6 +164,7 @@ impl RelayServer {
             watched,
             events,
             notif_tx: None,
+            channel_mode: false,
         }
     }
 
@@ -149,6 +172,12 @@ impl RelayServer {
     /// テストではセットしない (no-op になる)。
     pub fn set_notif_sender(&mut self, tx: mpsc::UnboundedSender<String>) {
         self.notif_tx = Some(tx);
+    }
+
+    /// ADR-005 Phase A: Claude Code Channel mode に切り替える。
+    /// `channel::run` から呼ばれる。tests / relay mode では false のまま。
+    pub fn enable_channel_mode(&mut self) {
+        self.channel_mode = true;
     }
 
     /// `kind:"event"` frame の本体 JSON を受け取って:
@@ -198,36 +227,74 @@ impl RelayServer {
             "event buffered"
         );
 
-        // ADR-004 Phase D: auth-worker McpSession DO に `kind:"notif"` frame で
-        // MCP `notifications/message` を back-pipe。DO 側で attached SSE channel
-        // 全部に fan-out される (Anthropic Claude.ai / Claude Code Web の real-time
-        // wake-up 経路)。notif_tx が None のテストでは silent no-op。
+        // notif_tx が None のテストでは silent no-op。
         let Some(tx) = self.notif_tx.as_ref() else {
             return;
         };
-        let notif_body = json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/message",
-            "params": {
-                "level": "info",
-                "logger": "cc-relay/issue-events",
-                "data": frame_body,
-            },
-        });
-        let frame = json!({
-            "kind": "notif",
-            "v": FRAME_VERSION,
-            "body": notif_body,
-        });
-        let payload = match serde_json::to_string(&frame) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "notif frame serialize failed");
-                return;
+
+        let payload = if self.channel_mode {
+            // ADR-005: Claude Code Channel notification — JSON-RPC をそのまま
+            // stdio に流す形式。`<channel source="cc-relay" ...>` envelope に
+            // 変換されて session context に inject される。
+            let preview = serde_json::to_string(frame_body).unwrap_or_else(|_| "{}".into());
+            let event_type = frame_body
+                .get("event_type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let delivery_id = frame_body
+                .get("delivery_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let notif = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/claude/channel",
+                "params": {
+                    "content": preview,
+                    "meta": {
+                        "event_type": event_type,
+                        "owner": owner,
+                        "repo": repo,
+                        "issue_number": number.to_string(),
+                        "delivery_id": delivery_id,
+                    },
+                },
+            });
+            match serde_json::to_string(&notif) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "channel notification serialize failed");
+                    return;
+                }
+            }
+        } else {
+            // ADR-004 Phase D (legacy): auth-worker McpSession DO に
+            // `kind:"notif"` frame で MCP `notifications/message` を back-pipe。
+            // SSE channel が attach されていれば fan-out される (現状の
+            // Anthropic harness は GET /mcp を開かないので発火しない)。
+            let notif_body = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {
+                    "level": "info",
+                    "logger": "cc-relay/issue-events",
+                    "data": frame_body,
+                },
+            });
+            let frame = json!({
+                "kind": "notif",
+                "v": FRAME_VERSION,
+                "body": notif_body,
+            });
+            match serde_json::to_string(&frame) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "notif frame serialize failed");
+                    return;
+                }
             }
         };
         if let Err(e) = tx.send(payload) {
-            tracing::warn!(error = %e, "notif back-pipe send failed (ws writer dropped)");
+            tracing::warn!(error = %e, "notif send failed (writer dropped)");
         }
     }
 
@@ -277,14 +344,22 @@ impl RelayServer {
             .and_then(|p| p.get("protocolVersion"))
             .and_then(Value::as_str)
             .unwrap_or(STUB_PROTOCOL_VERSION);
-        result_response(
-            id,
-            json!({
-                "protocolVersion": proto,
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-            }),
-        )
+        // ADR-005: channel mode は `experimental.claude/channel` 機能と
+        // instructions を一緒に advertise する。Claude Code はこの機能を
+        // 見て `notifications/claude/channel` listener を登録し、
+        // `<channel source="cc-relay" ...>` envelope を session context に
+        // inject できるようになる。
+        let mut capabilities = json!({ "tools": { "listChanged": false } });
+        let mut response = json!({
+            "protocolVersion": proto,
+            "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+        });
+        if self.channel_mode {
+            capabilities["experimental"] = json!({ "claude/channel": {} });
+            response["instructions"] = json!(CHANNEL_INSTRUCTIONS);
+        }
+        response["capabilities"] = capabilities;
+        result_response(id, response)
     }
 
     fn handle_tools_list(&self, id: Value) -> Value {
@@ -761,6 +836,26 @@ mod tests {
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(resp["result"]["serverInfo"]["name"], "cc-relay");
+        // default mode: no `claude/channel` capability, no instructions
+        assert!(resp["result"]["capabilities"]["experimental"].is_null());
+        assert!(resp["result"]["instructions"].is_null());
+    }
+
+    #[tokio::test]
+    async fn initialize_in_channel_mode_advertises_claude_channel_capability() {
+        let mut srv = server();
+        srv.enable_channel_mode();
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        )
+        .await
+        .unwrap();
+        assert!(resp["result"]["capabilities"]["experimental"]["claude/channel"].is_object());
+        assert!(resp["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("<channel"));
     }
 
     #[tokio::test]
@@ -928,6 +1023,76 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let arr: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(arr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_event_frame_in_channel_mode_pushes_jsonrpc_channel_notification() {
+        let (mut srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        srv.set_notif_sender(tx);
+        srv.enable_channel_mode();
+
+        let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"ippoan","repo":"cc-relay","issue_number":42}}}"#;
+        dispatch(&srv, sub).await.unwrap();
+
+        let frame = serde_json::json!({
+            "kind": "event",
+            "v": 1,
+            "event_type": "issue_comment.created",
+            "delivery_id": "deliv-xyz",
+            "owner": "ippoan",
+            "repo": "cc-relay",
+            "issue_number": 42,
+            "payload": {"action": "created", "comment": {"body": "hi"}},
+        });
+        srv.handle_event_frame(&frame);
+
+        let wire = rx.try_recv().expect("channel notif should be queued");
+        let parsed: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["method"], "notifications/claude/channel");
+        // meta must use string-only values per Claude Code Channels spec
+        assert_eq!(
+            parsed["params"]["meta"]["event_type"],
+            "issue_comment.created"
+        );
+        assert_eq!(parsed["params"]["meta"]["owner"], "ippoan");
+        assert_eq!(parsed["params"]["meta"]["repo"], "cc-relay");
+        assert_eq!(parsed["params"]["meta"]["issue_number"], "42");
+        assert_eq!(parsed["params"]["meta"]["delivery_id"], "deliv-xyz");
+        // content carries the raw event JSON so Claude has full context
+        let content = parsed["params"]["content"].as_str().unwrap();
+        assert!(content.contains("issue_comment.created"));
+        assert!(content.contains("ippoan/cc-relay") || content.contains("\"owner\":\"ippoan\""));
+    }
+
+    #[tokio::test]
+    async fn handle_event_frame_in_relay_mode_still_emits_kind_notif_back_pipe() {
+        // Phase D legacy back-pipe is preserved for relay (non-channel) mode.
+        let (mut srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        srv.set_notif_sender(tx);
+        // NOTE: channel_mode left at default (false) — this is the relay path.
+
+        let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"ippoan","repo":"cc-relay","issue_number":42}}}"#;
+        dispatch(&srv, sub).await.unwrap();
+
+        let frame = serde_json::json!({
+            "kind": "event",
+            "v": 1,
+            "event_type": "issue_comment.created",
+            "owner": "ippoan",
+            "repo": "cc-relay",
+            "issue_number": 42,
+            "payload": {"action": "created"},
+        });
+        srv.handle_event_frame(&frame);
+
+        let wire = rx.try_recv().expect("relay notif should be queued");
+        let parsed: Value = serde_json::from_str(&wire).unwrap();
+        // Relay mode wraps the JSON-RPC body in a `kind:"notif"` WS frame
+        assert_eq!(parsed["kind"], "notif");
+        assert_eq!(parsed["body"]["method"], "notifications/message");
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 //! - `get_plan` — placeholder until the broker carries plan state (#17).
 //! - `claim_task` / `update_task` — placeholder for #17 plan ops.
 
+pub mod channel;
 pub mod inbox;
 pub mod relay;
 pub mod watched_issues;

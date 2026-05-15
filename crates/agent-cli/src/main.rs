@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use agent_broker::auth::{self, default_scopes, AuthConfig, DEFAULT_BASE_URL, DEFAULT_CLIENT_ID};
 use agent_broker::{introspect, token_cache, Broker, GitHubBroker};
+use agent_mcp::channel::run as channel_run;
 use agent_mcp::relay::{run as relay_run, RelayConfig, RelayServer};
 use agent_mcp::McpConfig;
 use anyhow::{Context, Result};
@@ -51,6 +52,15 @@ enum Cmd {
     /// (`wss://mcp(-staging).ippoan.org/connect`) and serve as the host-side
     /// MCP server that Claude.ai connector POSTs land on. Long-running.
     Relay(RelayArgs),
+
+    /// ADR-005 Phase A: run as a Claude Code Channel (stdio MCP server with
+    /// `experimental: { "claude/channel": {} }` capability). Spawned by
+    /// Claude Code as a subprocess; reads JSON-RPC on stdin, writes on
+    /// stdout. Also opens an outbound WS to the auth-worker MCP relay to
+    /// receive GitHub webhook event frames and emits each one as a
+    /// `notifications/claude/channel` JSON-RPC notification, which Claude
+    /// Code injects into the session context as `<channel source="cc-relay" ...>`.
+    Channel(ChannelArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -105,6 +115,42 @@ struct RelayArgs {
     /// Agent id this binary advertises in `Broker::join` etc. Defaults to
     /// `host-broker`. The Phase C tool surface (`cc_relay_list_agents`) does
     /// not call `join`, but later tools (`notify_agent`) will.
+    #[arg(long, default_value = "host-broker")]
+    agent_id: String,
+}
+
+#[derive(Debug, Parser)]
+struct ChannelArgs {
+    /// Full WebSocket URL of the auth-worker relay endpoint that delivers
+    /// webhook events. Same default as `relay` mode — staging by default,
+    /// override for prod once #46 Phase G lands.
+    #[arg(
+        long,
+        env = "CC_RELAY_WS_URL",
+        default_value = "wss://mcp-staging.ippoan.org/connect"
+    )]
+    ws_url: String,
+
+    /// Path to the cached MCP access token (written by `auth` subcommand).
+    #[arg(long)]
+    token_path: Option<PathBuf>,
+
+    /// GitHub broker repo (`owner/repo`). Same shape as `relay` mode.
+    /// Required for the `cc_relay_list_agents` tool to function; Channel
+    /// mode keeps the broker so the tool surface is identical.
+    #[arg(long, env = "CC_RELAY_BROKER_REPO")]
+    broker_repo: String,
+
+    /// GitHub installation token for the broker. Phase A accepts it inline
+    /// like `relay` mode does; credential-resolver work is a follow-up.
+    #[arg(long, env = "CC_RELAY_BROKER_TOKEN")]
+    broker_token: String,
+
+    /// Broker Issue number. Required for `GitHubBroker::new`.
+    #[arg(long, env = "CC_RELAY_BROKER_ISSUE")]
+    broker_issue: u64,
+
+    /// Agent id this binary advertises in `Broker::join` etc.
     #[arg(long, default_value = "host-broker")]
     agent_id: String,
 }
@@ -165,6 +211,7 @@ fn main() -> ExitCode {
             Cmd::Stdio(args) => run_stdio(args).await,
             Cmd::Auth(args) => run_auth(args).await,
             Cmd::Relay(args) => run_relay(args).await,
+            Cmd::Channel(args) => run_channel_cmd(args).await,
         }
     });
 
@@ -219,6 +266,48 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         access_token: token_set.access_token,
     };
     relay_run(server, cfg).await.context("relay loop exited")
+}
+
+/// ADR-005 Phase A: dispatcher for `channel` subcommand. Mirrors `run_relay`
+/// (same broker / token resolution) but hands the constructed `RelayServer`
+/// to `agent_mcp::channel::run`, which serves stdio + outbound-WS instead of
+/// pumping WS frames bidirectionally.
+async fn run_channel_cmd(args: ChannelArgs) -> Result<()> {
+    let token_path = match args.token_path {
+        Some(p) => p,
+        None => token_cache::default_path().context("resolve default token path")?,
+    };
+    let token_set = token_cache::load(&token_path)
+        .with_context(|| format!("read token cache at {}", token_path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no cached token at {}; run `rust-mcp-agent auth` first",
+                token_path.display()
+            )
+        })?;
+
+    let (owner, repo) = args
+        .broker_repo
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("--broker-repo must be 'owner/repo'"))?;
+    let broker = GitHubBroker::new(
+        owner.to_string(),
+        repo.to_string(),
+        args.broker_issue,
+        args.agent_id,
+        &args.broker_token,
+    )
+    .context("build GitHubBroker")?;
+    let broker: Arc<dyn Broker> = Arc::new(broker);
+
+    let server = RelayServer::new(broker);
+    let cfg = RelayConfig {
+        ws_url: args.ws_url,
+        access_token: token_set.access_token,
+    };
+    channel_run(server, cfg)
+        .await
+        .context("channel loop exited")
 }
 
 async fn run_auth(args: AuthArgs) -> Result<()> {
