@@ -341,4 +341,20 @@ mod tests {
             other => panic!("expected Auth(_), got {other:?}"),
         }
     }
+
+    /// P10 #11: secret material must never appear in `Debug` output.
+    /// Both `TokenManager::Static` (PAT / installation token) and the
+    /// `Refreshable` mode (auth-worker JWT) must redact.
+    #[test]
+    fn debug_impl_does_not_leak_static_token() {
+        let secret = "ghp_supersecretvalue123456789abc";
+        let tm = TokenManager::static_token(secret);
+        let dbg = format!("{tm:?}");
+        assert!(
+            !dbg.contains(secret),
+            "TokenManager Debug leaked the static token: {dbg}"
+        );
+        // Sanity: variant tag is still present so logs remain useful.
+        assert!(dbg.contains("Static"), "Debug lost the variant tag: {dbg}");
+    }
 }

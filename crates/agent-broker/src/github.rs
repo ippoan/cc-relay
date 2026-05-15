@@ -23,6 +23,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tracing::instrument;
+
 use agent_core::{NotifyMessage, NotifyTarget, PlanOp, Priority, TaskSpec, TaskStatus};
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -434,6 +436,7 @@ impl GitHubBroker {
 
 #[async_trait]
 impl Broker for GitHubBroker {
+    #[instrument(skip(self), fields(self_id = %self.agent_id), err)]
     async fn join(&self, agent_id: &str) -> Result<()> {
         let id = agent_id.to_string();
         self.cas_update(move |snap| {
@@ -445,6 +448,7 @@ impl Broker for GitHubBroker {
         .await
     }
 
+    #[instrument(skip(self), fields(self_id = %self.agent_id), err)]
     async fn leave(&self, agent_id: &str) -> Result<()> {
         let id = agent_id.to_string();
         self.cas_update(move |snap| {
@@ -454,6 +458,16 @@ impl Broker for GitHubBroker {
         .await
     }
 
+    #[instrument(
+        skip(self, msg),
+        fields(
+            self_id = %self.agent_id,
+            to = ?msg.to,
+            msg_len = msg.message.len(),
+            priority = ?msg.priority,
+        ),
+        err,
+    )]
     async fn send(&self, msg: NotifyMessage) -> Result<()> {
         let payload = NotifyCommentBody {
             ty: "notify".into(),
@@ -488,6 +502,15 @@ impl Broker for GitHubBroker {
         Ok(())
     }
 
+    #[instrument(
+        skip(self),
+        fields(
+            self_id = %self.agent_id,
+            since_id = cursor.last_comment_id,
+            had_etag = cursor.last_etag.is_some(),
+        ),
+        err,
+    )]
     async fn fetch_since(&self, cursor: Cursor) -> Result<(Vec<NotifyMessage>, Cursor)> {
         // Page 1 is a conditional GET so an idle session never burns
         // through the rate limit. Subsequent pages (if any) follow the
@@ -590,22 +613,41 @@ impl Broker for GitHubBroker {
         ))
     }
 
+    #[instrument(skip(self), fields(self_id = %self.agent_id), err)]
     async fn list_agents(&self) -> Result<Vec<AgentMeta>> {
         let (snap, _) = self.get_snapshot().await?;
         Ok(snap.agents)
     }
 
+    #[instrument(skip(self), fields(self_id = %self.agent_id), err)]
     async fn get_plan(&self) -> Result<Vec<TaskSpec>> {
         let (snap, _) = self.get_snapshot().await?;
         Ok(snap.plan)
     }
 
+    #[instrument(
+        skip(self, op),
+        fields(self_id = %self.agent_id, op_kind = plan_op_kind(&op)),
+        err,
+    )]
     async fn plan_op(&self, op: PlanOp) -> Result<()> {
         self.cas_update(move |snap| apply_plan_op(snap, &op)).await
     }
 
     fn self_id(&self) -> &str {
         &self.agent_id
+    }
+}
+
+/// Static label for [`PlanOp`] used by the `plan_op` tracing span. Free
+/// function (rather than `impl`) to keep the discriminator close to its
+/// only consumer and avoid touching `agent-core` for a trace-only field.
+fn plan_op_kind(op: &PlanOp) -> &'static str {
+    match op {
+        PlanOp::Add { .. } => "add",
+        PlanOp::Claim { .. } => "claim",
+        PlanOp::Update { .. } => "update",
+        PlanOp::Remove { .. } => "remove",
     }
 }
 
