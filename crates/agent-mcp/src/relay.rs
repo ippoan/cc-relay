@@ -202,7 +202,9 @@ impl RelayServer {
         // MCP `notifications/message` を back-pipe。DO 側で attached SSE channel
         // 全部に fan-out される (Anthropic Claude.ai / Claude Code Web の real-time
         // wake-up 経路)。notif_tx が None のテストでは silent no-op。
-        let Some(tx) = self.notif_tx.as_ref() else { return };
+        let Some(tx) = self.notif_tx.as_ref() else {
+            return;
+        };
         let notif_body = json!({
             "jsonrpc": "2.0",
             "method": "notifications/message",
