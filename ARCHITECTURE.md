@@ -203,8 +203,11 @@ Two additional observations from the probe that constrain the design:
 
 ## ADR-002: End-user auth via auth-worker MCP OAuth Provider
 
-**Status:** Accepted (2026-05-14). Issue
-[#33](https://github.com/ippoan/cc-relay/issues/33).
+**Status:** Superseded for the Claude Code on Web hot path by ADR-003
+(2026-05-15、#35 で確定)。CI / non-Claude-Code-Web 環境 (host laptop での
+binary 直接実行、自動化ジョブ等) の **fallback flow** としては引き続き
+有効。Issue [#33](https://github.com/ippoan/cc-relay/issues/33) / 移行先
+[#35](https://github.com/ippoan/cc-relay/issues/35)。
 
 ### Context
 
@@ -322,9 +325,11 @@ workaround.
 
 ## ADR-003: Sandbox auth via Claude Code MCP connector + auth-worker user-less relay
 
-**Status:** Proposed (2026-05-14). Supersedes ADR-002 (host-side mount) for
-the Claude Code on Web hot path. ADR-002 is retained as the CI / non-Claude-
-Code fallback. Issue [#35](https://github.com/ippoan/cc-relay/issues/35).
+**Status:** Accepted (2026-05-15)。staging で実機検証完了 (#33 closed
+completed)、`.mcp.json` が repo root に commit 済、`docs/credentials.md` §1
+が ADR-003 経路で書き直し済 (`INTERNAL_SHARED_SECRET` 撤廃含む)。ADR-002
+(host-side mount) は **fallback** に降格、Claude Code on Web の hot path は
+ADR-003。Issue [#35](https://github.com/ippoan/cc-relay/issues/35)。
 
 ### Context
 
