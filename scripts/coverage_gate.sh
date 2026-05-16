@@ -96,7 +96,13 @@ for i in range(1, len(parts), 2):
     if "/registry/" in path or "/.cargo/" in path:
         continue
 
-    rel = path.split("/cc-relay/")[-1] if "/cc-relay/" in path else path
+    # Normalize to a workspace-relative path: keep everything from the
+    # first `crates/` onwards. (CI runs the job from
+    # `/home/runner/work/cc-relay/cc-relay/`, so `path.split("/cc-relay/")`
+    # would only chop the first occurrence and leave a leading `cc-relay/`
+    # behind that doesn't match `coverage_100.toml` entries.)
+    m = re.search(r"(crates/[^\s]+)$", path)
+    rel = m.group(1) if m else path
     files_seen.add(rel)
 
     uncov = []
