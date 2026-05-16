@@ -25,14 +25,21 @@ cd "$(dirname "$0")/.."
 # Files NOT enforced — shim files only.
 IGNORE_REGEX='crates/agent-cli/src/(main|runners)\.rs|crates/agent-mcp/src/(relay_ws|channel_ws)\.rs'
 
-cargo llvm-cov --workspace --all-features --no-fail-fast \
-    --ignore-filename-regex "$IGNORE_REGEX" \
-    --text \
-    > coverage.txt
+# Two-call pattern: run tests + collect raw profdata first, then ask
+# `cargo llvm-cov report` for both the human-readable summary and the
+# per-line annotated source. Combining `--text` with the test run on
+# the first call only emits per-line text into stdout interleaved with
+# test runner output on some `cargo-llvm-cov` versions — invoking
+# `report --text` separately produces a deterministic file.
+cargo llvm-cov --workspace --all-features --no-fail-fast --no-report
 
 cargo llvm-cov report --summary-only \
     --ignore-filename-regex "$IGNORE_REGEX" \
     | tee coverage_summary.txt
+
+cargo llvm-cov report --text \
+    --ignore-filename-regex "$IGNORE_REGEX" \
+    > coverage.txt
 
 echo
 echo "=== uncovered source lines (line count == 0) ==="
