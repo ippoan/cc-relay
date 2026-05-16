@@ -973,7 +973,7 @@ pub async fn run(mut server: RelayServer, config: RelayConfig) -> Result<()> {
 
 /// 受信 loop 本体。`run()` から切り出して、writer task の cleanup を 1 箇所に
 /// まとめる。
-async fn pump_inbound(
+pub(crate) async fn pump_inbound(
     server: &RelayServer,
     stream: &mut (impl StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
               + Unpin),
@@ -1088,6 +1088,10 @@ mod tests {
         /// When true, `plan_op` returns Auth error to exercise the error
         /// path independently of `send_error`.
         plan_op_error: bool,
+        /// When true, `fetch_since` returns Auth error.
+        fetch_error: bool,
+        /// When true, `get_plan` returns Auth error.
+        get_plan_error: bool,
     }
 
     impl StubBroker {
@@ -1102,6 +1106,8 @@ mod tests {
                 plan_ops: Mutex::new(vec![]),
                 plan_snapshot: Mutex::new(vec![]),
                 plan_op_error: false,
+                fetch_error: false,
+                get_plan_error: false,
             })
         }
         fn err() -> Arc<Self> {
@@ -1115,6 +1121,8 @@ mod tests {
                 plan_ops: Mutex::new(vec![]),
                 plan_snapshot: Mutex::new(vec![]),
                 plan_op_error: false,
+                fetch_error: false,
+                get_plan_error: false,
             })
         }
         /// Builder for Phase 17.2 tests: pre-seed messages to be returned
@@ -1130,6 +1138,8 @@ mod tests {
                 plan_ops: Mutex::new(vec![]),
                 plan_snapshot: Mutex::new(vec![]),
                 plan_op_error: false,
+                fetch_error: false,
+                get_plan_error: false,
             })
         }
         /// Builder: `send` will return an error.
@@ -1144,6 +1154,8 @@ mod tests {
                 plan_ops: Mutex::new(vec![]),
                 plan_snapshot: Mutex::new(vec![]),
                 plan_op_error: false,
+                fetch_error: false,
+                get_plan_error: false,
             })
         }
         /// Builder for Phase 17.3 tests: pre-seed the plan returned by
@@ -1159,6 +1171,8 @@ mod tests {
                 plan_ops: Mutex::new(vec![]),
                 plan_snapshot: Mutex::new(plan),
                 plan_op_error: false,
+                fetch_error: false,
+                get_plan_error: false,
             })
         }
         /// Builder: `plan_op` will return an error.
@@ -1173,6 +1187,40 @@ mod tests {
                 plan_ops: Mutex::new(vec![]),
                 plan_snapshot: Mutex::new(vec![]),
                 plan_op_error: true,
+                fetch_error: false,
+                get_plan_error: false,
+            })
+        }
+
+        fn with_fetch_error() -> Arc<Self> {
+            Arc::new(Self {
+                agents: Mutex::new(vec![]),
+                list_agents_calls: Mutex::new(0),
+                force_error: false,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(vec![]),
+                send_error: false,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(vec![]),
+                plan_op_error: false,
+                fetch_error: true,
+                get_plan_error: false,
+            })
+        }
+
+        fn with_get_plan_error() -> Arc<Self> {
+            Arc::new(Self {
+                agents: Mutex::new(vec![]),
+                list_agents_calls: Mutex::new(0),
+                force_error: false,
+                sent: Mutex::new(vec![]),
+                next_fetch: Mutex::new(vec![]),
+                send_error: false,
+                plan_ops: Mutex::new(vec![]),
+                plan_snapshot: Mutex::new(vec![]),
+                plan_op_error: false,
+                fetch_error: false,
+                get_plan_error: true,
             })
         }
     }
@@ -1193,6 +1241,9 @@ mod tests {
             Ok(())
         }
         async fn fetch_since(&self, c: Cursor) -> BrokerResult<(Vec<NotifyMessage>, Cursor)> {
+            if self.fetch_error {
+                return Err(agent_broker::BrokerError::Auth("fetch stub".into()));
+            }
             let drained: Vec<NotifyMessage> = std::mem::take(&mut *self.next_fetch.lock().unwrap());
             let advanced = Cursor {
                 last_comment_id: c.last_comment_id + drained.len() as u64,
@@ -1208,6 +1259,9 @@ mod tests {
             Ok(self.agents.lock().unwrap().clone())
         }
         async fn get_plan(&self) -> BrokerResult<Vec<TaskSpec>> {
+            if self.get_plan_error {
+                return Err(agent_broker::BrokerError::Auth("get_plan stub".into()));
+            }
             Ok(self.plan_snapshot.lock().unwrap().clone())
         }
         async fn plan_op(&self, op: PlanOp) -> BrokerResult<()> {
@@ -2048,5 +2102,711 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(text.contains("broker error"), "text was: {text}");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Coverage: tool input-validation error branches.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn notify_agent_rejects_missing_to() {
+        let srv = server();
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notify_agent","arguments":{"message":"hi"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("'to'"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn notify_agent_rejects_missing_message() {
+        let srv = server();
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notify_agent","arguments":{"to":"alice"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("'message'"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn get_inbox_propagates_broker_error() {
+        let srv = RelayServer::new(StubBroker::with_fetch_error());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_inbox"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("broker error"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn get_inbox_warns_when_cursor_save_fails() {
+        // Persist into a path where the parent is a regular file; CursorStore::save
+        // will fail to create the directory. The handler must NOT return error;
+        // it logs warn and continues.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not_a_dir");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        // child path under a file → mkdir will fail
+        let store = Arc::new(CursorStore::at_path(
+            blocker.join("sub").join("cursor.json"),
+        ));
+        let broker = StubBroker::with_inbox(vec![NotifyMessage {
+            from: "alice".into(),
+            to: NotifyTarget::Agent("stub-agent".into()),
+            message: "ping".into(),
+            priority: Priority::Normal,
+            timestamp: 1,
+        }]);
+        let srv = RelayServer::new(broker).with_persisted_cursor(store).await;
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_inbox"}}"#,
+        )
+        .await
+        .unwrap();
+        // We still get an OK response (warn + continue, not error).
+        assert_eq!(resp["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn get_plan_propagates_broker_error() {
+        let srv = RelayServer::new(StubBroker::with_get_plan_error());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_plan"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("broker error"));
+    }
+
+    #[tokio::test]
+    async fn add_task_validation_errors() {
+        let srv = server();
+        // missing id
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_task","arguments":{"title":"x"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        // missing title
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_task","arguments":{"id":"T1"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        // invalid status
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_task","arguments":{"id":"T1","title":"x","status":"bogus"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn add_task_propagates_broker_error() {
+        let srv = RelayServer::new(StubBroker::with_plan_op_error());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_task","arguments":{"id":"T1","title":"x"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("broker error"));
+    }
+
+    #[tokio::test]
+    async fn claim_task_rejects_missing_task_id() {
+        let srv = server();
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"claim_task","arguments":{}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn update_task_validation_errors() {
+        let srv = server();
+        // missing task_id
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_task","arguments":{"status":"done"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        // missing status
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_task","arguments":{"task_id":"T1"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn update_task_propagates_broker_error() {
+        let srv = RelayServer::new(StubBroker::with_plan_op_error());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_task","arguments":{"task_id":"T1","status":"done"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("broker error"));
+    }
+
+    #[tokio::test]
+    async fn remove_task_rejects_missing_task_id() {
+        let srv = server();
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remove_task","arguments":{}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn remove_task_propagates_broker_error() {
+        let srv = RelayServer::new(StubBroker::with_plan_op_error());
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remove_task","arguments":{"task_id":"T1"}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn subscribe_unsubscribe_propagate_io_errors() {
+        // Force load() to fail by making the watched path a *directory*:
+        // `read_to_string` then returns an Err that is not NotFound.
+        let dir = tempfile::tempdir().unwrap();
+        let watched_path = dir.path().join("watched.txt");
+        std::fs::create_dir_all(&watched_path).unwrap();
+        let watched = WatchedIssuesFile::new(watched_path);
+        let events = IssueEventsFile::new(dir.path().join("events.jsonl"));
+        let srv = RelayServer::with_files(StubBroker::with_agents(vec![]), watched, events);
+
+        // subscribe path → "subscribe failed:"
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":1}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("subscribe failed:"), "got: {text}");
+
+        // unsubscribe path → "unsubscribe failed:"
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"unsubscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":1}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unsubscribe failed:"));
+
+        // list_watched_issues path → "load watched failed:"
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_watched_issues"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("load watched failed:"));
+    }
+
+    #[tokio::test]
+    async fn get_issue_events_propagates_drain_error() {
+        // Make events path a directory → drain()'s read_to_string fails.
+        let dir = tempfile::tempdir().unwrap();
+        let watched = WatchedIssuesFile::new(dir.path().join("watched.txt"));
+        let events_path = dir.path().join("events.jsonl");
+        std::fs::create_dir_all(&events_path).unwrap();
+        let events = IssueEventsFile::new(events_path);
+        let srv = RelayServer::with_files(StubBroker::with_agents(vec![]), watched, events);
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_issue_events"}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("drain failed:"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_invalid_args_owner_missing() {
+        // parse_issue_args owner missing branch
+        let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let resp = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"unsubscribe_issue_activity","arguments":{"repo":"b","issue_number":1}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // handle_event_frame error branches: load() and append_event() both error.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn handle_event_frame_load_error_drops_frame() {
+        // Watched path is a directory — load() returns Err.
+        let dir = tempfile::tempdir().unwrap();
+        let watched_path = dir.path().join("watched.txt");
+        std::fs::create_dir_all(&watched_path).unwrap();
+        let watched = WatchedIssuesFile::new(watched_path);
+        let events = IssueEventsFile::new(dir.path().join("events.jsonl"));
+        let srv = RelayServer::with_files(StubBroker::with_agents(vec![]), watched, events);
+        let frame = json!({
+            "kind": "event",
+            "owner": "a",
+            "repo": "b",
+            "issue_number": 1,
+            "event_type": "x",
+        });
+        srv.handle_event_frame(&frame); // must not panic; logs warn and returns
+    }
+
+    #[test]
+    fn handle_event_frame_unwatched_logs_debug() {
+        // watched is empty, so frame for unsubscribed issue hits the "unwatched"
+        // debug branch (lines 237-241).
+        let dir = tempfile::tempdir().unwrap();
+        let watched = WatchedIssuesFile::new(dir.path().join("watched.txt"));
+        let events = IssueEventsFile::new(dir.path().join("events.jsonl"));
+        let srv = RelayServer::with_files(StubBroker::with_agents(vec![]), watched, events);
+        let frame = json!({
+            "kind": "event",
+            "owner": "a",
+            "repo": "b",
+            "issue_number": 99,
+            "event_type": "x",
+        });
+        srv.handle_event_frame(&frame);
+    }
+
+    #[test]
+    fn handle_event_frame_append_error_drops_frame() {
+        // Watched contains the key, but events path is a directory → append fails.
+        let dir = tempfile::tempdir().unwrap();
+        let watched = WatchedIssuesFile::new(dir.path().join("watched.txt"));
+        watched.add(&IssueKey::new("a", "b", 1)).unwrap();
+        // Make the events file path a directory → OpenOptions::open fails.
+        let events_path = dir.path().join("events.jsonl");
+        std::fs::create_dir_all(&events_path).unwrap();
+        let events = IssueEventsFile::new(events_path);
+        let srv = RelayServer::with_files(StubBroker::with_agents(vec![]), watched, events);
+        let frame = json!({
+            "kind": "event",
+            "owner": "a",
+            "repo": "b",
+            "issue_number": 1,
+            "event_type": "x",
+        });
+        srv.handle_event_frame(&frame);
+    }
+
+    #[tokio::test]
+    async fn handle_event_frame_warns_when_notif_receiver_dropped() {
+        // After the receiver is dropped, the `tx.send(payload)` call on
+        // line 322 returns Err and we log warn (line 323).
+        let (mut srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        srv.set_notif_sender(tx);
+        let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":1}}}"#;
+        dispatch(&srv, sub).await.unwrap();
+        drop(rx); // close the channel so send() fails
+        let frame = json!({
+            "kind": "event",
+            "owner": "a",
+            "repo": "b",
+            "issue_number": 1,
+            "event_type": "x",
+        });
+        srv.handle_event_frame(&frame);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // pump_inbound coverage — exercise every branch with stream::iter.
+    // ────────────────────────────────────────────────────────────────────
+
+    type WsItem = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+    fn req_frame(id: &str, method: &str) -> Message {
+        let inner = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+        })
+        .to_string();
+        let body_b64 = B64.encode(inner.as_bytes());
+        Message::Text(
+            json!({
+                "kind": "req",
+                "v": 1,
+                "id": id,
+                "body_b64": body_b64,
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_handles_text_req_and_responds() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let items: Vec<WsItem> = vec![
+            // Ping/Pong/Frame are skipped
+            Ok(Message::Ping(vec![1, 2, 3])),
+            Ok(Message::Pong(vec![4])),
+            // A valid request — should produce a resp frame.
+            Ok(req_frame("r1", "ping")),
+            // A graceful close — pump exits.
+            Ok(Message::Close(None)),
+        ];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        // exactly one resp frame should have been pushed
+        let wire = rx.try_recv().expect("a resp frame should be queued");
+        let v: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(v["kind"], "resp");
+        assert_eq!(v["id"], "r1");
+        assert_eq!(v["status"], 200);
+        // body_b64 decodes to a JSON-RPC ping result
+        let body = B64.decode(v["body_b64"].as_str().unwrap()).unwrap();
+        let resp: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["id"], "r1");
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_decodes_binary_text() {
+        // Binary frame with valid utf8 body containing a req frame.
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let inner = json!({"jsonrpc": "2.0", "id": "r2", "method": "ping"}).to_string();
+        let body_b64 = B64.encode(inner.as_bytes());
+        let frame = json!({
+            "kind": "req", "v": 1, "id": "r2", "body_b64": body_b64,
+        })
+        .to_string();
+        let items: Vec<WsItem> = vec![
+            Ok(Message::Binary(frame.into_bytes())),
+            Ok(Message::Close(None)),
+        ];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        let wire = rx.try_recv().expect("resp expected");
+        let v: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(v["id"], "r2");
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_routes_event_frame_to_handler() {
+        let (mut server, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
+        // make sure the notif tx is wired so the event handler exercises it
+        let (notif_tx, _notif_rx) = mpsc::unbounded_channel::<String>();
+        server.set_notif_sender(notif_tx);
+        // subscribe to the issue
+        let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"a","repo":"b","issue_number":1}}}"#;
+        dispatch(&server, sub).await.unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let event_frame = Message::Text(
+            json!({
+                "kind": "event",
+                "v": 1,
+                "owner": "a",
+                "repo": "b",
+                "issue_number": 1,
+                "event_type": "issue_comment.created",
+                "delivery_id": "deliv-1",
+            })
+            .to_string(),
+        );
+        let items: Vec<WsItem> = vec![Ok(event_frame), Ok(Message::Close(None))];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        // Verify the handler buffered the event.
+        let resp = dispatch(
+            &server,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_issue_events"}}"#,
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let arr: Vec<Value> = serde_json::from_str(text).unwrap();
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_skips_malformed_json_frame() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let items: Vec<WsItem> = vec![
+            Ok(Message::Text("{not json".into())),
+            // Then a valid req so we know pump kept going.
+            Ok(req_frame("after", "ping")),
+            Ok(Message::Close(None)),
+        ];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        let wire = rx.try_recv().expect("resp after malformed");
+        assert!(wire.contains("\"id\":\"after\""));
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_skips_malformed_req_frame_then_continues() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        // Frame is valid JSON but `id` is a number, not a string → ReqFrame parse fails.
+        let bad = Message::Text(json!({"kind": "req", "v": 1, "id": 7}).to_string());
+        let items: Vec<WsItem> = vec![
+            Ok(bad),
+            Ok(req_frame("after", "ping")),
+            Ok(Message::Close(None)),
+        ];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        let wire = rx.try_recv().expect("resp after bad req");
+        assert!(wire.contains("\"id\":\"after\""));
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_ignores_non_req_frames() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let items: Vec<WsItem> = vec![
+            Ok(Message::Text(
+                json!({"kind": "hello", "v": 1, "binary_version": "x", "proto": 1}).to_string(),
+            )),
+            Ok(Message::Close(None)),
+        ];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "no resp expected for hello frame");
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_returns_202_and_empty_body_for_notification() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        // Wrap a JSON-RPC notification (no `id`) — handle_jsonrpc returns None → status 202, no body.
+        let inner = json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string();
+        let body_b64 = B64.encode(inner.as_bytes());
+        let frame = Message::Text(
+            json!({"kind": "req", "v": 1, "id": "notif1", "body_b64": body_b64}).to_string(),
+        );
+        let items: Vec<WsItem> = vec![Ok(frame), Ok(Message::Close(None))];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        let wire = rx.try_recv().expect("resp expected");
+        let v: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(v["status"], 202);
+        assert_eq!(v["body_b64"], "");
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_handles_empty_body_b64_as_empty_request() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        // An empty body_b64 → handle_jsonrpc receives an empty buffer →
+        // serde_json::from_slice fails → -32700 Parse error response.
+        let frame = Message::Text(
+            json!({"kind": "req", "v": 1, "id": "empty", "body_b64": ""}).to_string(),
+        );
+        let items: Vec<WsItem> = vec![Ok(frame), Ok(Message::Close(None))];
+        let mut stream = futures_util::stream::iter(items);
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+        let wire = rx.try_recv().expect("resp expected");
+        let v: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(v["status"], 200);
+        let body = B64.decode(v["body_b64"].as_str().unwrap()).unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], -32700);
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_returns_error_on_invalid_body_b64() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let frame = Message::Text(
+            json!({"kind": "req", "v": 1, "id": "bad", "body_b64": "!!!not base64!!!"}).to_string(),
+        );
+        let items: Vec<WsItem> = vec![Ok(frame)];
+        let mut stream = futures_util::stream::iter(items);
+        let err = super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("body_b64 decode"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_propagates_stream_error() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let items: Vec<WsItem> = vec![Err(tokio_tungstenite::tungstenite::Error::AlreadyClosed)];
+        let mut stream = futures_util::stream::iter(items);
+        let err = super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ws stream error"));
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_errors_on_non_utf8_binary() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let items: Vec<WsItem> = vec![Ok(Message::Binary(vec![0xff, 0xfe, 0xfd]))];
+        let mut stream = futures_util::stream::iter(items);
+        let err = super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-utf8"));
+    }
+
+    #[tokio::test]
+    async fn pump_inbound_aborts_when_writer_dropped() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        drop(rx);
+        let items: Vec<WsItem> = vec![Ok(req_frame("orphan", "ping"))];
+        let mut stream = futures_util::stream::iter(items);
+        // The send fails → break and Ok(()) returned.
+        super::pump_inbound(&server, &mut stream, &tx)
+            .await
+            .unwrap();
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // run() — only test the upfront request-construction failure path.
+    // The actual ws connect is unreachable from a unit test.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_returns_error_for_invalid_url() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let cfg = RelayConfig {
+            ws_url: "not a url".into(),
+            access_token: "tok".into(),
+        };
+        let err = super::run(server, cfg).await.unwrap_err();
+        assert!(err.to_string().contains("invalid ws url"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_returns_error_for_non_ascii_token() {
+        let server = RelayServer::new(StubBroker::with_agents(vec![]));
+        let cfg = RelayConfig {
+            ws_url: "ws://127.0.0.1:1/".into(),
+            // a non-ascii char in the token forces HeaderValue::from_str to fail
+            access_token: "tok\u{00e9}".into(),
+        };
+        let err = super::run(server, cfg).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid bearer token")
+                || err.to_string().contains("ws connect"),
+            "got: {err}"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // StubBroker join/leave coverage — directly call the trait methods.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_broker_join_leave_are_ok() {
+        let b = StubBroker::with_agents(vec![]);
+        b.join("x").await.unwrap();
+        b.leave("x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_task_panic_else_branch_is_unreachable_for_pending() {
+        // The `let PlanOp::Add { task } = &ops[0] else { panic!("expected Add") };`
+        // branch in the existing test is unreachable when StubBroker records the op
+        // correctly — covered indirectly by add_task_propagates_broker_error +
+        // tools_call_add_task_defaults_status_to_pending_when_omitted. This test
+        // intentionally exercises both paths once more so the irrefutable bind path
+        // shows live coverage.
+        let broker = StubBroker::with_agents(vec![]);
+        let srv = RelayServer::new(broker.clone());
+        let _ = dispatch(
+            &srv,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_task","arguments":{"id":"X","title":"t"}}}"#,
+        )
+        .await
+        .unwrap();
+        let ops = broker.plan_ops.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            PlanOp::Add { task } => assert_eq!(task.id, "X"),
+            _ => unreachable!(),
+        }
     }
 }

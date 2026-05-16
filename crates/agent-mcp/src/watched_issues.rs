@@ -322,4 +322,104 @@ mod tests {
         // drain は rename するので 2 回目は空
         assert!(f.drain().unwrap().is_empty());
     }
+
+    // ---------- coverage: error / edge-case branches ----------
+
+    /// `WatchedIssuesFile::load()` returns a contextualized error when
+    /// `read_to_string` fails for a reason other than NotFound. Pointing
+    /// at a directory (instead of a regular file) reliably produces an
+    /// IsADirectory error on Linux.
+    #[test]
+    fn watched_load_io_error_other_than_notfound() {
+        let dir = tempdir().unwrap();
+        // Path *is* a directory → read_to_string fails with IsADirectory.
+        let f = WatchedIssuesFile::new(dir.path().to_path_buf());
+        let err = f.load().unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("read"), "unexpected error: {msg}");
+    }
+
+    /// `write_set` calls `create_dir_all(parent)`. Force a failure by
+    /// putting a *file* where `write_set`'s `create_dir_all` would need
+    /// to create a directory. We first add a key successfully to create
+    /// the file, then point a sibling `WatchedIssuesFile` at a nested
+    /// path *under* that file so its parent must become a directory.
+    /// `load()` on the child path sees ENOTDIR — same effect as a
+    /// generic non-NotFound read error — but the test asserts the error
+    /// is contextualized either way (load or create-dir).
+    #[test]
+    fn watched_write_set_create_dir_failure() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("blocker.txt");
+        std::fs::write(&blocker, "x").unwrap();
+        // Path lives under the regular file `blocker.txt` — both load()
+        // and write_set()'s create_dir_all will surface ENOTDIR.
+        let target = blocker.join("nested").join("watched.txt");
+        let f = WatchedIssuesFile::new(target);
+        let key = IssueKey::new("a", "b", 1);
+        let err = f.add(&key).unwrap_err();
+        let msg = format!("{:#}", err);
+        // Whichever step surfaces first, the error message includes the
+        // contextual prefix added by `with_context` ("read" or
+        // "create dir") — assert on either.
+        assert!(
+            msg.contains("read") || msg.contains("create dir"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// `IssueEventsFile::path()` accessor.
+    #[test]
+    fn events_path_accessor() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("events.jsonl");
+        let f = IssueEventsFile::new(p.clone());
+        assert_eq!(f.path(), p.as_path());
+    }
+
+    /// `append_event` propagates `create_dir_all` failure (parent is a
+    /// regular file).
+    #[test]
+    fn events_append_create_dir_failure() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a dir").unwrap();
+        let f = IssueEventsFile::new(blocker.join("nested").join("events.jsonl"));
+        let err = f.append_event(&serde_json::json!({"x": 1})).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("create dir"), "unexpected error: {msg}");
+    }
+
+    /// `drain` surfaces a non-NotFound read error (path points at a
+    /// directory).
+    #[test]
+    fn events_drain_io_error_other_than_notfound() {
+        let dir = tempdir().unwrap();
+        let f = IssueEventsFile::new(dir.path().to_path_buf());
+        let err = f.drain().unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("read"), "unexpected error: {msg}");
+    }
+
+    /// `drain` is fail-open on rename failure: it logs a warn and still
+    /// returns the entries successfully. We force the rename to fail by
+    /// pre-creating a non-empty directory at the `.read` destination.
+    #[test]
+    fn events_drain_rename_failure_is_fail_open() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("events.jsonl");
+        std::fs::write(&p, "{\"a\":1}\n").unwrap();
+        // Block rename: destination exists and is a non-empty directory,
+        // which makes rename(2) fail with ENOTEMPTY / EISDIR.
+        let read_path = p.with_extension("jsonl.read");
+        std::fs::create_dir(&read_path).unwrap();
+        std::fs::write(read_path.join("occupant"), "block").unwrap();
+
+        let f = IssueEventsFile::new(p.clone());
+        let entries = f.drain().unwrap();
+        assert_eq!(entries.len(), 1);
+        // File still exists because rename failed — it's the "may surface
+        // again next call" path described in the source.
+        assert!(p.exists());
+    }
 }

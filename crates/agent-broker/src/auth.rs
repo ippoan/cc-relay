@@ -553,4 +553,343 @@ mod tests {
         let back = base64url_decode(&s).unwrap();
         assert_eq!(back, v);
     }
+
+    #[test]
+    fn base64url_roundtrip_with_trailing_bits() {
+        // 1 byte → 2 base64 chars + 4 trailing bits → exercises the
+        // `if bits > 0` tail emission in the test-only encoder.
+        let v = b"x";
+        let s = base64url_encode(v);
+        let back = base64url_decode(&s).unwrap();
+        assert_eq!(back, v);
+        // 2 bytes → 3 base64 chars + 2 trailing bits → also hits the
+        // tail emission path.
+        let v = b"xy";
+        let s = base64url_encode(v);
+        let back = base64url_decode(&s).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn base64url_decode_handles_special_alphabet_and_padding() {
+        // Exercise the `b'-'`, `b'_'`, and `b'='` (padding terminator)
+        // arms of the decoder. We don't pin the exact byte values — just
+        // that decoding succeeds and the `=` terminator stops decoding.
+        let out = base64url_decode("A-_=").expect("should decode");
+        assert!(!out.is_empty());
+        // Sanity: `=` truly terminates — any trailing garbage after `=`
+        // is ignored.
+        let with_garbage = base64url_decode("A-_=zzzz").expect("should decode");
+        assert_eq!(out, with_garbage);
+    }
+
+    #[test]
+    fn base64url_decode_rejects_invalid_chars() {
+        // `!` is not in the base64url alphabet → decoder returns None.
+        assert!(base64url_decode("abc!").is_none());
+    }
+
+    #[test]
+    fn default_interval_returns_five() {
+        assert_eq!(default_interval(), 5);
+    }
+
+    #[test]
+    fn auth_config_default_uses_module_constants() {
+        let c = AuthConfig::default();
+        assert_eq!(c.base_url, DEFAULT_BASE_URL);
+        assert_eq!(c.client_id, DEFAULT_CLIENT_ID);
+        assert_eq!(c.scopes, default_scopes());
+    }
+
+    #[tokio::test]
+    async fn start_device_authorization_non_success_surfaces_other_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/device_authorization"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let err = start_device_authorization(&http, &cfg(server.uri()))
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                let s = e.to_string();
+                assert!(s.contains("device_authorization returned"));
+                assert!(s.contains("kaboom"));
+            }
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_device_authorization_transport_error() {
+        // Unreachable address → reqwest transport-layer failure.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let err = start_device_authorization(&http, &cfg("http://192.0.2.1:1".to_string()))
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                assert!(e.to_string().contains("HTTP transport"));
+            }
+            other => panic!("expected Other(transport), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_token_slow_down_widens_interval_then_succeeds() {
+        let server = MockServer::start().await;
+        // First poll: slow_down (covers the SlowDown branch).
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "slow_down",
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Second poll: success.
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "a.b.c",
+                "refresh_token": "rt",
+                "expires_in": 60,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let device = DeviceAuthorizationResponse {
+            device_code: "dc".into(),
+            user_code: "X".into(),
+            verification_uri: "u".into(),
+            verification_uri_complete: None,
+            expires_in: 600,
+            interval: 0, // 0 sleep, +5 still ok-ish — but saturating_add(5)=5s.
+                         // Set to negative so the .max(1) is exercised AND saturating_add(5) yields 6s
+                         // ... Actually keep 0; the first sleep is 1s (max(1)), then +5 = 6s.
+                         // We accept ~7s test wall time.
+        };
+        let t = poll_token(&http, &cfg(server.uri()), &device)
+            .await
+            .unwrap();
+        assert_eq!(t.access_token, "a.b.c");
+    }
+
+    #[tokio::test]
+    async fn poll_token_unparseable_error_body_surfaces_other_error() {
+        // 400 with a non-JSON body → parser falls into the `Err(_)` arm
+        // of TokenErrorResponse parsing → `code` is empty → OtherError
+        // path. Exercises both line 280 and line 289.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("not-json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let device = DeviceAuthorizationResponse {
+            device_code: "dc".into(),
+            user_code: "X".into(),
+            verification_uri: "u".into(),
+            verification_uri_complete: None,
+            expires_in: 600,
+            interval: 0,
+        };
+        let err = poll_token(&http, &cfg(server.uri()), &device)
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                let s = e.to_string();
+                assert!(s.contains("token endpoint error"), "got {s}");
+                assert!(s.contains("not-json"), "expected raw body in err, got {s}");
+            }
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_token_unknown_error_code_surfaces_other_error() {
+        // 400 + JSON with an unknown `error` code → hits the `other =>`
+        // arm of the match (line 290).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "device_code unknown",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let device = DeviceAuthorizationResponse {
+            device_code: "dc".into(),
+            user_code: "X".into(),
+            verification_uri: "u".into(),
+            verification_uri_complete: None,
+            expires_in: 600,
+            interval: 0,
+        };
+        let err = poll_token(&http, &cfg(server.uri()), &device)
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                let s = e.to_string();
+                assert!(s.contains("invalid_grant"), "got {s}");
+                assert!(s.contains("device_code unknown"), "got {s}");
+            }
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_token_success_without_expires_in_falls_back_to_jwt_exp() {
+        // Build a JWT whose `exp` claim is far in the future. The token
+        // endpoint returns no `expires_in`, so the code path on line 262
+        // (`jwt_exp(...).unwrap_or(...)`) is exercised.
+        let payload = serde_json::json!({ "exp": 9_999_999_999_i64 });
+        let payload_b64 = base64url_encode(serde_json::to_vec(&payload).unwrap().as_slice());
+        let jwt = format!("eyJhbGciOiJIUzI1NiJ9.{payload_b64}.sig");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": jwt,
+                "refresh_token": "rt",
+                // expires_in deliberately omitted
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let device = DeviceAuthorizationResponse {
+            device_code: "dc".into(),
+            user_code: "X".into(),
+            verification_uri: "u".into(),
+            verification_uri_complete: None,
+            expires_in: 600,
+            interval: 0,
+        };
+        let t = poll_token(&http, &cfg(server.uri()), &device)
+            .await
+            .unwrap();
+        assert_eq!(t.expires_at, 9_999_999_999);
+    }
+
+    #[tokio::test]
+    async fn poll_token_success_without_expires_in_and_bad_jwt_falls_back_to_plus_3600() {
+        // No `expires_in` AND an unparseable JWT → unwrap_or branch hits
+        // the `acquired_at + 3600` fallback (covers the `unwrap_or` arm).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "not-a-jwt",
+                "refresh_token": "rt",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let device = DeviceAuthorizationResponse {
+            device_code: "dc".into(),
+            user_code: "X".into(),
+            verification_uri: "u".into(),
+            verification_uri_complete: None,
+            expires_in: 600,
+            interval: 0,
+        };
+        let t = poll_token(&http, &cfg(server.uri()), &device)
+            .await
+            .unwrap();
+        assert!(t.expires_at >= t.acquired_at + 3600);
+    }
+
+    #[tokio::test]
+    async fn refresh_expired_surfaces_auth_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "expired_token",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let err = refresh(&http, &cfg(server.uri()), "rt-1")
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Auth(s) => assert!(s.contains("refresh_token expired")),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_pending_is_unexpected_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "authorization_pending",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let err = refresh(&http, &cfg(server.uri()), "rt-1")
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("unexpected")),
+            other => panic!("expected Other(unexpected), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_other_error_surfaces_other_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "boom",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let err = refresh(&http, &cfg(server.uri()), "rt-1")
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                let s = e.to_string();
+                assert!(s.contains("refresh endpoint error"), "got {s}");
+                assert!(s.contains("invalid_grant"), "got {s}");
+            }
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
 }

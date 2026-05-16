@@ -323,6 +323,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn debug_format_does_not_leak_token_material() {
+        // Static variant.
+        let m = TokenManager::static_token("gho_secret_value");
+        let s = format!("{m:?}");
+        assert!(s.contains("Static"), "expected Static in debug, got {s}");
+        assert!(
+            !s.contains("gho_secret_value"),
+            "token leaked in debug: {s}"
+        );
+
+        // Refreshable variant.
+        let now = token_cache::now_secs();
+        let path = write_cache(&sample(now + 3600));
+        let m = TokenManager::from_cache(
+            path,
+            cfg("http://unused".into()),
+            Some("shh".into()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let s = format!("{m:?}");
+        assert!(
+            s.contains("Refreshable"),
+            "expected Refreshable in debug, got {s}"
+        );
+        assert!(!s.contains("gho_initial"), "token leaked in debug: {s}");
+    }
+
+    #[tokio::test]
+    async fn refreshable_inactive_introspect_after_refresh_surfaces_auth_error() {
+        let server = MockServer::start().await;
+        // Refresh succeeds.
+        Mock::given(method("POST"))
+            .and(path("/mcp/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "jwt2.body.sig",
+                "refresh_token": "rt-2",
+                "scope": "mcp.read mcp.write",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Introspect reports the freshly-refreshed JWT as inactive.
+        Mock::given(method("POST"))
+            .and(path("/mcp/introspect"))
+            .and(header("authorization", "shh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": false,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let now = token_cache::now_secs();
+        let cache_path = write_cache(&sample(now + 60));
+        let m = TokenManager::from_cache(
+            cache_path,
+            cfg(server.uri()),
+            Some("shh".into()),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let err = m.ensure_fresh().await.unwrap_err();
+        match err {
+            BrokerError::Auth(s) => assert!(s.contains("introspect returned inactive")),
+            other => panic!("expected Auth(inactive), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn from_cache_incomplete_token_returns_auth_error() {
         // Cached set is missing github_token (auth was interrupted
         // before introspect).

@@ -274,6 +274,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn other_http_error_surfaces_other_error() {
+        // 500 is neither 401 nor 503, so we should hit the generic
+        // `!status.is_success()` branch.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/introspect"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let err = introspect(&http, &cfg(server.uri()), Some("shh"), "jwt.body.sig")
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                let s = e.to_string();
+                assert!(s.contains("500"), "expected status in message, got {s}");
+            }
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_error_surfaces_other_error() {
+        // Point at an unreachable host so reqwest fails at the transport
+        // layer (covers the `transport_err` mapper).
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        // Reserved TEST-NET-1 address — guaranteed unroutable.
+        let err = introspect(
+            &http,
+            &cfg("http://192.0.2.1:1".to_string()),
+            Some("shh"),
+            "jwt.body.sig",
+        )
+        .await
+        .unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                assert!(e.to_string().contains("HTTP transport"));
+            }
+            other => panic!("expected Other(transport), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn active_without_github_token_surfaces_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

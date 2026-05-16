@@ -25,6 +25,7 @@ jobs:
           - kind: fmt
           - kind: clippy
           - kind: test
+          - kind: coverage
     steps:
       - uses: actions/checkout@v6
 
@@ -32,9 +33,9 @@ jobs:
         run: rustup show active-toolchain
 
       # fmt は cargo build しないので cache 不要。
-      # clippy / test は別 artifact なので shared-key を matrix kind で分けて save 衝突
-      # ("Unable to reserve cache with key ..., another job may be creating this cache.")
-      # を避ける。save は main の push 時のみに絞り、PR は main の cache を restore する。
+      # clippy / test / coverage は別 artifact なので shared-key を matrix kind
+      # で分けて save 衝突を避ける。save は main の push 時のみに絞り、PR は main
+      # の cache を restore する。
       - uses: Swatinem/rust-cache@v2
         if: matrix.kind != 'fmt'
         with:
@@ -52,6 +53,21 @@ jobs:
       - name: cargo test
         if: matrix.kind == 'test'
         run: cargo test --workspace --all-features --no-fail-fast
+
+      # Coverage gate. `cargo-llvm-cov` runs the workspace tests under
+      # `-C instrument-coverage` and emits a per-file table. We then post-
+      # process to assert that every reported file is at 100% line coverage,
+      # ignoring the un-extractable I/O-loop bodies listed in
+      # `scripts/coverage_ignore.txt`.
+      - name: Install cargo-llvm-cov
+        if: matrix.kind == 'coverage'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: cargo llvm-cov (workspace) + 100% gate
+        if: matrix.kind == 'coverage'
+        run: bash scripts/coverage_gate.sh
 
   # Release build dry-run: same target / toolchain / strip step as
   # release.yml, but no artifact upload. Catches breakage on the

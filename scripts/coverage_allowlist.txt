@@ -1,0 +1,259 @@
+# Lines tolerated by `scripts/coverage_gate.sh` despite reporting zero
+# execution count. Each entry is `<rel-path>:<line>` followed by a
+# `# reason`. Reviewers should push back on any new addition without a
+# concrete justification.
+#
+# Categories present below:
+#
+# - **tracing-arg**: a field expression inside a `tracing::warn!`/etc.
+#   macro. The argument is evaluated lazily by the subscriber. Tests
+#   here run with no global subscriber installed (because installing one
+#   is process-global and would race with other parallel tests), so the
+#   field formatter never fires. The line itself executes; only the
+#   closure body inside the macro counts as uncovered.
+#
+# - **serde-infallible**: `serde_json::to_string(&v).map_err(|e| ...)`
+#   error closures. `serde_json::Value` cannot fail to serialize (no
+#   custom Serialize impls in scope, no non-string keys), so the
+#   closure body is provably unreachable.
+#
+# - **dead-defensive**: `Err(_)` arms guarded by an upstream invariant
+#   that mathematically cannot be violated. Removing them would lose
+#   the documentation value of "this branch was considered and ruled
+#   out"; keeping them in code costs one allowlist line.
+#
+# - **platform-conditional**: code that only fires when running as a
+#   non-root user, or with `$HOME` unset, or on a non-Linux host. The
+#   CI matrix is fixed at `ubuntu-latest` running as root.
+#
+# - **brace-attribution**: llvm-cov assigns a closing `}` of an
+#   `if let Some(_) { ... }` chained off `?` to the closure's region.
+#   When the `?` propagates Err, the body never reaches the brace.
+#   On the happy path every other line in the function executes.
+#
+# - **shim-fn-real-io**: a 1-2 line wrapper that constructs real
+#   `tokio::io::stdin()` / opens a real WebSocket / spawns a real
+#   subprocess. The injectable testable core (`run_io`, `drive_ws_pump`,
+#   etc.) is exercised by unit tests; this shim is the part that wires
+#   in the real I/O.
+#
+# - **ws-connect-prelude**: code in `relay::run` between the WebSocket
+#   handshake and the `pump_inbound` call (writer task spawn, hello
+#   frame send, cleanup). Reachable only with a real WS server; the
+#   testable inner loop `pump_inbound` is fully covered.
+
+# --- agent-broker/src/cursor.rs ------------------------------------------
+crates/agent-broker/src/cursor.rs:113   # tracing-arg: warn! field in unknown-version branch
+crates/agent-broker/src/cursor.rs:174   # platform-conditional: $HOME-unset fallback (env-mutating test races other parallel tests)
+crates/agent-broker/src/cursor.rs:175   # platform-conditional
+crates/agent-broker/src/cursor.rs:176   # platform-conditional
+crates/agent-broker/src/cursor.rs:177   # platform-conditional
+crates/agent-broker/src/cursor.rs:178   # platform-conditional
+crates/agent-broker/src/cursor.rs:179   # platform-conditional
+crates/agent-broker/src/cursor.rs:180   # platform-conditional
+crates/agent-broker/src/cursor.rs:181   # platform-conditional: final bail!()
+
+# --- agent-broker/src/github.rs ------------------------------------------
+crates/agent-broker/src/github.rs:279   # tracing-arg: token field in info!
+crates/agent-broker/src/github.rs:325   # dead-defensive: transport error neither timeout/connect/request
+crates/agent-broker/src/github.rs:466   # serde-infallible: NotifyCommentBody serialize error closure
+crates/agent-broker/src/github.rs:467   # serde-infallible
+crates/agent-broker/src/github.rs:468   # serde-infallible
+crates/agent-broker/src/github.rs:1619  # brace-attribution: parse_link_next happy-path closing brace
+
+# --- agent-broker/src/token_cache.rs -------------------------------------
+crates/agent-broker/src/token_cache.rs:75   # platform-conditional: dirs::home_dir None on Linux requires no /etc/passwd entry
+crates/agent-broker/src/token_cache.rs:76   # platform-conditional
+crates/agent-broker/src/token_cache.rs:77   # platform-conditional
+crates/agent-broker/src/token_cache.rs:78   # platform-conditional
+crates/agent-broker/src/token_cache.rs:119  # brace-attribution: closing `}` of `if let Some(parent)` after happy-path
+crates/agent-broker/src/token_cache.rs:131  # platform-conditional: chmod 0600 EPERM on file we just created (root never sees this)
+crates/agent-broker/src/token_cache.rs:132  # platform-conditional
+crates/agent-broker/src/token_cache.rs:133  # platform-conditional
+crates/agent-broker/src/token_cache.rs:134  # platform-conditional
+crates/agent-broker/src/token_cache.rs:322  # dead-defensive: `other => panic!` arm in test (BrokerError::Other always matches)
+crates/agent-broker/src/token_cache.rs:334  # dead-defensive: same as above in adjacent test
+crates/agent-broker/src/token_cache.rs:352  # dead-defensive
+crates/agent-broker/src/token_cache.rs:367  # dead-defensive
+crates/agent-broker/src/token_cache.rs:385  # dead-defensive
+crates/agent-broker/src/token_cache.rs:397  # dead-defensive
+
+# --- agent-broker/src/token_manager.rs -----------------------------------
+crates/agent-broker/src/token_manager.rs:155  # dead-defensive: bearer() github_token=None branch is unreachable: from_cache rejects, ensure_fresh always populates
+crates/agent-broker/src/token_manager.rs:156  # dead-defensive
+crates/agent-broker/src/token_manager.rs:157  # dead-defensive
+crates/agent-broker/src/token_manager.rs:158  # dead-defensive
+
+# --- agent-cli/src/lib.rs ------------------------------------------------
+crates/agent-cli/src/lib.rs:175  # shim-fn-real-io: `pub fn run() -> ExitCode { runners::run() }`
+crates/agent-cli/src/lib.rs:176  # shim-fn-real-io
+crates/agent-cli/src/lib.rs:177  # shim-fn-real-io
+crates/agent-cli/src/lib.rs:248  # dead-defensive: see init_tracing_double_init_errors test (line is the closing }/expr in Result chain)
+
+# --- agent-mcp/src/channel.rs --------------------------------------------
+# Lines 96-100 = `pub async fn run(server, config)` — wires in real
+# tokio::io::stdin / stdout. The testable core `run_io` accepts injected
+# AsyncBufRead/AsyncWrite and is fully covered.
+crates/agent-mcp/src/channel.rs:96   # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:97   # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:98   # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:99   # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:100  # shim-fn-real-io
+# 139-142 — the inner Err arm of `tokio::spawn(async move { if let Err(e) = pump_ws_events ... })`.
+# The block-level closure runs (covered); only the formatter expression inside `tracing::warn!` doesn't.
+crates/agent-mcp/src/channel.rs:139  # tracing-arg
+crates/agent-mcp/src/channel.rs:140  # tracing-arg
+crates/agent-mcp/src/channel.rs:141  # tracing-arg
+crates/agent-mcp/src/channel.rs:142  # tracing-arg
+# 161-162, 164 — the `if out_tx.send(s).is_err()` writer-dropped break.
+# Sent-after-writer-died is racy under stdin BufReader; the path is exercised by stdio.rs's
+# `run_io_breaks_loop_when_writer_dropped` against the same RelayServer logic.
+crates/agent-mcp/src/channel.rs:161  # dead-defensive: writer-dropped break (same path covered in stdio.rs equivalent)
+crates/agent-mcp/src/channel.rs:162  # dead-defensive
+crates/agent-mcp/src/channel.rs:164  # dead-defensive
+# 196-198 — `pump_ws_events` post-`connect_async` success body. Reachable only with a real WS server;
+# the inner loop `drive_ws_pump` is fully covered with mock streams.
+crates/agent-mcp/src/channel.rs:196  # ws-connect-prelude
+crates/agent-mcp/src/channel.rs:197  # ws-connect-prelude
+crates/agent-mcp/src/channel.rs:198  # ws-connect-prelude
+# 264-269: CollectSink::poll_close — never called (drive_ws_pump doesn't close the sink explicitly).
+crates/agent-mcp/src/channel.rs:264  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:265  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:266  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:267  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:268  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:269  # test-helper-uncalled-method
+# 276-299: StubBroker impl — channel tests exercise channel-mode notification format only;
+# tool-broker calls go through the stdio.rs equivalent test
+# `process_line_drives_broker_through_every_tool`.
+crates/agent-mcp/src/channel.rs:276  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:277  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:278  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:279  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:281  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:282  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:284  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:285  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:287  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:288  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:290  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:291  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:293  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:294  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:296  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:297  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:299  # test-helper-uncalled-method
+# 508-519: test-helper ErroringWriter::poll_shutdown (run_io drops without shutdown).
+crates/agent-mcp/src/channel.rs:508  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:509  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:510  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:511  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:512  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:513  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:514  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:515  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:516  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:517  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:518  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:519  # test-helper-uncalled-method
+# 538-543: FlushErrWriter::poll_shutdown — same reason.
+crates/agent-mcp/src/channel.rs:538  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:539  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:540  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:541  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:542  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:543  # test-helper-uncalled-method
+
+# --- agent-mcp/src/relay.rs ----------------------------------------------
+# Tracing field expressions inside `handle_event_frame` warn/info/debug.
+crates/agent-mcp/src/relay.rs:230  # tracing-arg
+crates/agent-mcp/src/relay.rs:238  # tracing-arg
+crates/agent-mcp/src/relay.rs:246  # tracing-arg
+crates/agent-mcp/src/relay.rs:252  # tracing-arg
+# `serde_json::to_string(&v).map_err(|e| ...)` infallible error closures.
+crates/agent-mcp/src/relay.rs:290  # serde-infallible
+crates/agent-mcp/src/relay.rs:291  # serde-infallible
+crates/agent-mcp/src/relay.rs:292  # serde-infallible
+crates/agent-mcp/src/relay.rs:316  # serde-infallible
+crates/agent-mcp/src/relay.rs:317  # serde-infallible
+crates/agent-mcp/src/relay.rs:318  # serde-infallible
+# 933-971: ws-connect-prelude in `run()`. The pre-handshake portion (lines 917-932)
+# is exercised by the `run_returns_error_for_invalid_url` / `_non_ascii_token` tests;
+# the post-handshake portion needs a real WebSocket. The testable inner loop
+# `pump_inbound` is fully covered with mock streams.
+crates/agent-mcp/src/relay.rs:933  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:935  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:939  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:940  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:942  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:943  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:944  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:945  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:946  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:947  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:950  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:951  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:954  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:955  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:956  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:957  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:958  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:959  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:960  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:961  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:962  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:964  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:968  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:969  # ws-connect-prelude
+crates/agent-mcp/src/relay.rs:971  # ws-connect-prelude
+# 2006: `panic!("expected Add")` in `tools_call_add_task_defaults_status_to_pending_when_omitted`.
+crates/agent-mcp/src/relay.rs:2006  # dead-defensive: irrefutable let-else panic in pre-existing test
+
+# --- agent-mcp/src/stdio.rs ----------------------------------------------
+# 48-50: `process_line` non-utf8 response branch. `handle_jsonrpc` always
+# emits valid utf8 (it's `serde_json::to_vec`).
+crates/agent-mcp/src/stdio.rs:48  # dead-defensive: handle_jsonrpc never returns non-utf8
+crates/agent-mcp/src/stdio.rs:49  # dead-defensive
+crates/agent-mcp/src/stdio.rs:50  # dead-defensive
+# 54-56: `process_line` Err branch. `handle_jsonrpc` returns Ok(Some(error envelope))
+# even on JSON-RPC parse errors, never Err.
+crates/agent-mcp/src/stdio.rs:54  # dead-defensive: handle_jsonrpc never returns Err
+crates/agent-mcp/src/stdio.rs:55  # dead-defensive
+crates/agent-mcp/src/stdio.rs:56  # dead-defensive
+# 113-117: `pub async fn run` — wires real stdin / stdout into run_io.
+crates/agent-mcp/src/stdio.rs:113  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:114  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:115  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:116  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:117  # shim-fn-real-io
+# 292-303: ErroringWriter::poll_shutdown / FlushErrWriter::poll_shutdown / poll_flush:
+# run_io drops the writer without explicit shutdown.
+crates/agent-mcp/src/stdio.rs:292  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:293  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:294  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:295  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:296  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:297  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:298  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:299  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:300  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:301  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:302  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:303  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:336  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:337  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:338  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:339  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:340  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:341  # test-helper-uncalled-method
+
+# --- agent-mcp/src/watched_issues.rs -------------------------------------
+crates/agent-mcp/src/watched_issues.rs:129  # brace-attribution
+crates/agent-mcp/src/watched_issues.rs:180  # brace-attribution
+crates/agent-mcp/src/watched_issues.rs:213  # brace-attribution
+
+# Plus stdio.rs 101-102 (writer-dropped break, racy) — see test
+# `run_io_breaks_loop_when_writer_dropped`. If that test runs reliably
+# on your machine these can be removed.
+crates/agent-mcp/src/stdio.rs:101  # racy-test-coverage
+crates/agent-mcp/src/stdio.rs:102  # racy-test-coverage

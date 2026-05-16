@@ -1408,4 +1408,657 @@ mod tests {
             Some("https://api.github.com/.../comments?page=2"),
         );
     }
+
+    // ---------- coverage: error / edge-case branches ----------
+
+    /// `default_version()` only fires when JSON omits `v`. Drive it via
+    /// serde so the function shows as executed.
+    #[test]
+    fn snapshot_default_version_used_when_v_missing() {
+        let snap: Snapshot = serde_json::from_str(r#"{"agents":[],"plan":[]}"#).unwrap();
+        assert_eq!(snap.v, SNAPSHOT_VERSION);
+    }
+
+    /// 404 on GET issue → `BrokerError::NotFound`.
+    #[tokio::test]
+    async fn get_snapshot_404_surfaces_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.list_agents().await.unwrap_err();
+        assert!(matches!(err, BrokerError::NotFound(_)));
+    }
+
+    /// Non-2xx (and not 404/401/rate-limit) GET → `Other`.
+    #[tokio::test]
+    async fn get_snapshot_other_4xx_surfaces_other() {
+        let server = MockServer::start().await;
+        // 418 isn't special-cased anywhere.
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(418))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.list_agents().await.unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                assert!(e.to_string().contains("418"), "unexpected: {e}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// PATCH issue → 401 → `BrokerError::Auth`.
+    #[tokio::test]
+    async fn put_snapshot_401_surfaces_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(serde_json::json!({ "body": "" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.join("alice").await.unwrap_err();
+        assert!(matches!(err, BrokerError::Auth(_)));
+    }
+
+    /// PATCH issue → 4xx-other (not 401, not 412) → `Other`.
+    #[tokio::test]
+    async fn put_snapshot_other_status_surfaces_other() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(serde_json::json!({ "body": "" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(422))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.join("alice").await.unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("422")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// `leave` → routes through cas_update + put_snapshot.
+    #[tokio::test]
+    async fn leave_removes_agent_from_snapshot() {
+        let server = MockServer::start().await;
+        let snap = Snapshot {
+            v: 1,
+            agents: vec![
+                AgentMeta {
+                    agent_id: "alice".into(),
+                    joined_at: 1,
+                },
+                AgentMeta {
+                    agent_id: "bob".into(),
+                    joined_at: 2,
+                },
+            ],
+            plan: vec![],
+        };
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(issue_body(&snap)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        b.leave("alice").await.unwrap();
+    }
+
+    /// `get_plan` round-trips the snapshot's `plan`.
+    #[tokio::test]
+    async fn get_plan_round_trip() {
+        let server = MockServer::start().await;
+        let snap = Snapshot {
+            v: 1,
+            agents: vec![],
+            plan: vec![task("T-1", "x")],
+        };
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_body(&snap)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let plan = b.get_plan().await.unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].id, "T-1");
+    }
+
+    /// `plan_op` happy-path: Add a new task via CAS.
+    #[tokio::test]
+    async fn plan_op_add_via_broker() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(serde_json::json!({ "body": "" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        b.plan_op(PlanOp::Add {
+            task: task("T-1", "x"),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `self_id` returns the configured agent id verbatim.
+    #[tokio::test]
+    async fn self_id_returns_configured_id() {
+        let server = MockServer::start().await;
+        let b = fresh_broker(&server, "alice").await;
+        assert_eq!(b.self_id(), "alice");
+    }
+
+    /// Surfaces the non-Conflict CAS branch (Err(e) returns from
+    /// cas_update — exercised by 404 on GET inside put_snapshot's loop;
+    /// we drive it via a non-2xx PATCH that becomes Other, but only one
+    /// attempt: cas_update propagates a non-Conflict error verbatim).
+    #[tokio::test]
+    async fn cas_update_propagates_non_conflict_error_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_json(serde_json::json!({ "body": "" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // First (and only) PATCH → 401 → Auth (non-Conflict) so cas_update
+        // takes the `Err(e) => return Err(e)` arm.
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.join("alice").await.unwrap_err();
+        assert!(matches!(err, BrokerError::Auth(_)));
+    }
+
+    // ---------- apply_plan_op: remaining branches ----------
+
+    #[test]
+    fn plan_op_add_dup_id_errors() {
+        let mut snap = Snapshot {
+            plan: vec![task("T-1", "x")],
+            ..Default::default()
+        };
+        let err = apply_plan_op(
+            &mut snap,
+            &PlanOp::Add {
+                task: task("T-1", "y"),
+            },
+        )
+        .unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("task id already exists")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_op_update_sets_status_and_notes() {
+        let mut snap = Snapshot {
+            plan: vec![task("T-1", "x")],
+            ..Default::default()
+        };
+        apply_plan_op(
+            &mut snap,
+            &PlanOp::Update {
+                task_id: "T-1".into(),
+                status: TaskStatus::InProgress,
+                notes: Some("ongoing".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(snap.plan[0].status, TaskStatus::InProgress);
+        assert_eq!(snap.plan[0].notes.as_deref(), Some("ongoing"));
+    }
+
+    #[test]
+    fn plan_op_update_missing_task_is_not_found() {
+        let mut snap = Snapshot::default();
+        let err = apply_plan_op(
+            &mut snap,
+            &PlanOp::Update {
+                task_id: "T-X".into(),
+                status: TaskStatus::Done,
+                notes: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, BrokerError::NotFound(_)));
+    }
+
+    #[test]
+    fn plan_op_remove_existing_task_returns_ok() {
+        let mut snap = Snapshot {
+            plan: vec![task("T-1", "x"), task("T-2", "y")],
+            ..Default::default()
+        };
+        apply_plan_op(
+            &mut snap,
+            &PlanOp::Remove {
+                task_id: "T-1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(snap.plan.len(), 1);
+        assert_eq!(snap.plan[0].id, "T-2");
+    }
+
+    // ---------- parse_rate_limit_signal: non-rate-limited branches ----------
+
+    /// `remaining != 0` → not a rate-limit signal. We drive it indirectly
+    /// by serving a 200 with `x-ratelimit-remaining: 4999`; the broker
+    /// must NOT surface RateLimited and the body must round-trip.
+    #[tokio::test]
+    async fn rate_limit_signal_skips_when_remaining_nonzero() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "4999")
+                    .insert_header("x-ratelimit-reset", "0")
+                    .set_body_json(serde_json::json!({ "body": "" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let _ = b.list_agents().await.unwrap();
+    }
+
+    /// `remaining == 0` but status is not 403/429 → not a rate-limit
+    /// signal. Status 200 with remaining=0 must NOT surface RateLimited.
+    #[tokio::test]
+    async fn rate_limit_signal_skips_when_status_not_403_or_429() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-reset", "0")
+                    .set_body_json(serde_json::json!({ "body": "" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let _ = b.list_agents().await.unwrap();
+    }
+
+    // ---------- parse_link_next: malformed / no-next branches ----------
+
+    /// Link header contains entries but none has `rel="next"` — should
+    /// stop after the first page even though pagination header is set.
+    #[tokio::test]
+    async fn fetch_since_link_header_without_next_stops() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "link",
+                        "<https://example/page2>; rel=\"last\", <https://example/page0>; rel=\"first\"",
+                    )
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let (msgs, _) = b.fetch_since(Cursor::beginning()).await.unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    /// Link header where `rel="next"` part has no `<...>` brackets —
+    /// parser must fall through and return None, ending pagination.
+    #[tokio::test]
+    async fn fetch_since_link_header_malformed_next_falls_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", "garbled; rel=\"next\"")
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let (msgs, _) = b.fetch_since(Cursor::beginning()).await.unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    /// Link header where `rel="next"` part has `<>` (empty brackets) —
+    /// parser's `lt + 1 < gt` guard fires and the loop falls through to
+    /// returning None.
+    #[tokio::test]
+    async fn fetch_since_link_header_empty_brackets_falls_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", "<>; rel=\"next\"")
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let (msgs, _) = b.fetch_since(Cursor::beginning()).await.unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    // ---------- fetch_since: paginated error paths ----------
+
+    /// 401 on page-2 of a paginated fetch → `Auth` with the
+    /// pagination-specific message.
+    #[tokio::test]
+    async fn fetch_since_pagination_401_surfaces_auth() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let page2_url = format!("{base}/repos/owner/repo/issues/42/comments?page=2");
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", format!("<{page2_url}>; rel=\"next\"").as_str())
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.fetch_since(Cursor::beginning()).await.unwrap_err();
+        match err {
+            BrokerError::Auth(s) => assert!(s.contains("pagination")),
+            other => panic!("expected Auth(pagination), got {other:?}"),
+        }
+    }
+
+    /// 4xx-other on page-2 of a paginated fetch → `Other` with the
+    /// pagination-specific message.
+    #[tokio::test]
+    async fn fetch_since_pagination_other_status_surfaces_other() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let page2_url = format!("{base}/repos/owner/repo/issues/42/comments?page=2");
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .and(query_param("per_page", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", format!("<{page2_url}>; rel=\"next\"").as_str())
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(500))
+            // page-2 GET goes through send_with_retry, which retries 5xx
+            // up to the broker's transport budget (3 in tests).
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.fetch_since(Cursor::beginning()).await.unwrap_err();
+        // 5xx exhaustion bubbles up as Other(exhausted ...).
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("exhausted")),
+            other => panic!("expected Other(exhausted), got {other:?}"),
+        }
+    }
+
+    /// `send` 401 → `BrokerError::Auth`.
+    #[tokio::test]
+    async fn send_401_surfaces_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b
+            .send(NotifyMessage {
+                from: "alice".into(),
+                to: NotifyTarget::Agent("bob".into()),
+                message: "hi".into(),
+                priority: Priority::Normal,
+                timestamp: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrokerError::Auth(_)));
+    }
+
+    /// `send` non-2xx, non-401 → `Other`.
+    #[tokio::test]
+    async fn send_other_status_surfaces_other() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/issues/42/comments"))
+            .respond_with(ResponseTemplate::new(422))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b
+            .send(NotifyMessage {
+                from: "alice".into(),
+                to: NotifyTarget::Agent("bob".into()),
+                message: "hi".into(),
+                priority: Priority::Normal,
+                timestamp: 0,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("422")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// Trigger the `transport_err` helper via a malformed JSON response.
+    /// `get_snapshot` calls `resp.json().await.map_err(transport_err)?;`
+    /// on a 200 OK, so returning non-JSON bytes drives both the
+    /// `transport_err` function and the JSON-decode error path.
+    #[tokio::test]
+    async fn malformed_json_body_surfaces_via_transport_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("not really json {{{"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.list_agents().await.unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                let s = format!("{:#}", e);
+                assert!(s.contains("HTTP transport"), "unexpected: {s}");
+            }
+            other => panic!("expected Other(HTTP transport), got {other:?}"),
+        }
+    }
+
+    /// Exercise the `delay_ms > 0` branch in the 5xx retry path. We use
+    /// a broker with `backoff_start_ms = 1` (one millisecond) so the
+    /// sleep at line ~284 actually fires but the test still finishes
+    /// quickly.
+    #[tokio::test]
+    async fn five_xx_retry_with_nonzero_backoff_exercises_sleep() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let snap = Snapshot::default();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_body(&snap)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Hand-construct broker with backoff_start_ms = 1 so the
+        // `if delay_ms > 0 { sleep }` branch in the 5xx arm fires.
+        let mut b = GitHubBroker::new("owner", "repo", 42, "alice", "ghs_test")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_rate_limit_inline_cap_secs(0);
+        b.backoff_start_ms = 1;
+        b.backoff_max_ms = 1;
+        b.max_transport_retries = 3;
+        let _ = b.list_agents().await.unwrap();
+    }
+
+    /// Drive the connect-error transport-retry branch. Point the broker
+    /// at an unreachable address; reqwest yields `is_connect()`, which
+    /// is one of the retryable predicates. After exhausting retries, the
+    /// loop returns `Other(exhausted...)`.
+    #[tokio::test]
+    async fn transport_connect_error_with_nonzero_backoff_exercises_sleep() {
+        // Same trick as five_xx case but for the transport-error arm
+        // (lines 313-323) so the `delay_ms > 0` sleep is exercised there.
+        let mut b = GitHubBroker::new("owner", "repo", 42, "alice", "ghs_test")
+            .unwrap()
+            .with_base_url("http://127.0.0.1:1")
+            .with_rate_limit_inline_cap_secs(0);
+        b.backoff_start_ms = 1;
+        b.backoff_max_ms = 1;
+        b.max_transport_retries = 2;
+        let err = b.list_agents().await.unwrap_err();
+        assert!(matches!(err, BrokerError::Other(_)));
+    }
+
+    /// Drive the connect-error transport-retry branch. Point the broker
+    /// at an unreachable address; reqwest yields `is_connect()`, which
+    /// is one of the retryable predicates. After exhausting retries, the
+    /// loop returns `Other(exhausted...)`.
+    #[tokio::test]
+    async fn transport_connect_error_is_retried_then_exhausts() {
+        // 127.0.0.1:1 is a privileged port that should refuse connection.
+        let b = GitHubBroker::new("owner", "repo", 42, "alice", "ghs_test")
+            .unwrap()
+            .with_base_url("http://127.0.0.1:1")
+            .with_test_timing()
+            .with_rate_limit_inline_cap_secs(0);
+        let err = b.list_agents().await.unwrap_err();
+        match err {
+            BrokerError::Other(e) => {
+                let s = e.to_string();
+                assert!(
+                    s.contains("exhausted") || s.contains("HTTP transport"),
+                    "unexpected: {s}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
 }
