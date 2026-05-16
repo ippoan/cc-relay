@@ -26,6 +26,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # HTTPS intercepting proxy CA との互換性のため)。workspace の reqwest
 # feature unification 目的でこちらも合わせて native-roots に固定。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
