@@ -22,6 +22,9 @@ dist/
 
 # Generated coverage / profiling
 coverage/
+coverage.txt
+coverage.json
+coverage_summary.txt
 *.profraw
 *.profdata
 

@@ -34,3 +34,22 @@ pub use introspect::IntrospectionActive;
 pub use token_cache::TokenSet;
 pub use token_manager::TokenManager;
 pub use types::{AgentMeta, BrokerError, Cursor, Result};
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    /// Install a tracing subscriber for the current process, exactly
+    /// once. Called from any test that exercises a `tracing::warn!` /
+    /// `info!` / `debug!` line whose lazy formatter args we want
+    /// covered (otherwise llvm-cov reports the field-expression line
+    /// as zero-count even though the surrounding macro line ran).
+    pub(crate) fn init_tracing() {
+        use std::sync::OnceLock;
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::TRACE)
+                .try_init();
+        });
+    }
+}

@@ -34,3 +34,10 @@ dirs = "5"
 # body, query) without touching api.github.com.
 wiremock = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# Installed once per process via `tests::ensure_tracing()` so that
+# `tracing::warn!(field = %x.display(), ...)` lazy formatter args
+# actually evaluate during test runs — without a subscriber installed,
+# llvm-cov reports those argument expressions as zero-count even though
+# the surrounding `warn!` line did execute.
+tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }

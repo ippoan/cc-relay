@@ -11,6 +11,10 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "agent_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rust-mcp-agent"
 path = "src/main.rs"

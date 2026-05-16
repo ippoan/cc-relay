@@ -236,6 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_file_falls_back_to_beginning() {
+        crate::test_utils::init_tracing();
         let dir = tempdir();
         let path = dir.join("corrupt.json");
         tokio::fs::write(&path, b"not-json-at-all").await.unwrap();
@@ -246,6 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_version_falls_back_to_beginning() {
+        crate::test_utils::init_tracing();
         let dir = tempdir();
         let path = dir.join("future.json");
         tokio::fs::write(&path, br#"{"v":99,"last_comment_id":7,"last_etag":"x"}"#)
@@ -269,6 +271,95 @@ mod tests {
             .unwrap();
         let tmp = dir.join("atomic.json.tmp");
         assert!(!tmp.exists(), "tmp file should have been renamed away");
+    }
+
+    #[tokio::test]
+    async fn load_returns_beginning_when_read_fails_non_notfound() {
+        // Reading a directory path returns EISDIR (not NotFound) → exercises
+        // the `Err(e)` arm with the tracing::warn.
+        let dir = tempdir();
+        let store = CursorStore::at_path(&dir);
+        let c = store.load().await;
+        assert_eq!(c, Cursor::beginning());
+    }
+
+    #[tokio::test]
+    async fn save_errors_when_rename_target_is_directory() {
+        // Create the destination as a non-empty directory so the final
+        // rename fails — exercises the cleanup-then-error branch.
+        let dir = tempdir();
+        let path = dir.join("state.json");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("decoy"), b"x").unwrap();
+        let store = CursorStore::at_path(&path);
+        let err = store
+            .save(&Cursor {
+                last_comment_id: 7,
+                last_etag: None,
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("rename"), "expected rename in err, got {msg}");
+        // The tmp file should have been cleaned up.
+        let tmp = path.with_extension("json.tmp");
+        assert!(
+            !tmp.exists() || tmp.is_dir(),
+            "tmp file should have been removed after failed rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_accessor_returns_constructed_path() {
+        let dir = tempdir();
+        let p = dir.join("state.json");
+        let store = CursorStore::at_path(&p);
+        assert_eq!(store.path(), p.as_path());
+    }
+
+    #[test]
+    fn default_version_returns_schema_version() {
+        // Direct call: also exercised indirectly via the deserialize
+        // default-attribute on `v` (see deserialize_missing_v_uses_default).
+        assert_eq!(default_version(), SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn load_accepts_file_missing_v_field_via_serde_default() {
+        // No `v` in JSON → serde calls `default_version()` to fill it →
+        // load returns the cursor (SCHEMA_VERSION matches the default).
+        let dir = tempdir();
+        let path = dir.join("nov.json");
+        std::fs::write(&path, br#"{"last_comment_id":11,"last_etag":"E"}"#).unwrap();
+        let store = CursorStore::at_path(&path);
+        let c = store.load().await;
+        assert_eq!(c.last_comment_id, 11);
+        assert_eq!(c.last_etag.as_deref(), Some("E"));
+    }
+
+    #[test]
+    fn home_dir_returns_path_when_home_set() {
+        // HOME is set in any sane test env; this exercises the happy path
+        // (lines 171-173). The error / USERPROFILE branches mutate global
+        // env which is racy across tests — covered only opportunistically.
+        let home = home_dir().expect("HOME should be set in test env");
+        assert!(home.is_absolute() || !home.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn new_creates_state_directory_under_home() {
+        // CursorStore::new resolves home_dir() and creates `~/.cc-relay`.
+        // We can't easily override HOME without racy global env mutation,
+        // so just call new() with a deterministic session id and verify
+        // the resulting file path falls under `<home>/.cc-relay/`.
+        let store = CursorStore::new("unit/test#new-cov").expect("new should succeed");
+        let p = store.path();
+        let s = p.to_string_lossy();
+        assert!(
+            s.contains("/.cc-relay/state-"),
+            "unexpected path layout: {s}"
+        );
+        assert!(s.ends_with(".json"), "expected .json suffix, got {s}");
     }
 
     #[test]

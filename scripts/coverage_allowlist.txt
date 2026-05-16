@@ -1,0 +1,161 @@
+# Lines tolerated by `scripts/coverage_gate.sh` despite reporting zero
+# execution count. Each entry is `<rel-path>:<line>` followed by a
+# `# reason`. Reviewers should push back on any new addition without a
+# concrete justification.
+#
+# This file is the **truthful record** of the few lines that cannot be
+# exercised by a unit test; everything else MUST execute under
+# `cargo test --workspace`. The gate fails if a new uncovered line
+# appears that isn't on this list.
+#
+# Convention adopted from `ippoan/ci-workflows`'s `coverage_100.toml` —
+# opt-in 100% enforcement on files listed in `coverage_100.toml`, with
+# per-line carve-outs documented inline here.
+#
+# Categories:
+#
+# - **platform-conditional**: code that only fires on a host where
+#   `$HOME` is unset / `dirs::home_dir()` returns None / `chmod` fails
+#   with EPERM. CI runs as root on ubuntu-latest so these paths are
+#   never reached.
+#
+# - **dead-defensive-transport**: `Err(_)` arm in `send_with_retry`
+#   catching reqwest errors that are neither `is_timeout()`,
+#   `is_connect()`, nor `is_request()`. In practice every reqwest error
+#   produced during request-building or sending matches one of those
+#   three predicates.
+#
+# - **brace-attribution**: llvm-cov assigns the closing `}` of an
+#   `if let X { ... }` arm or `with_context(|| ...)?` chain to the
+#   pattern's region. The arm body executes (covered) but llvm-cov
+#   reports the closing brace as zero-count. Cosmetic.
+#
+# - **shim-fn-real-io**: a 1-5 line wrapper forwarding into a function
+#   in another file that owns real I/O construction (`tokio::io::stdin`,
+#   `tokio::io::stdout`, full file-level WS connect). The testable inner
+#   core lives in a sibling function and is fully covered.
+#
+# - **dead-defensive-test-panic**: a `_ => panic!("expected X")` arm in
+#   a test that asserts a specific enum variant. The variant is fixed by
+#   the call shape so the panic body is unreachable. Kept as
+#   self-documenting; covering it would mean a contrived test that
+#   relies on internal details to throw.
+#
+# - **test-helper-uncalled-method**: trait impl method (e.g.
+#   `AsyncWrite::poll_shutdown`) on a test-local mock that the unit
+#   under test never calls. Mocking the trait requires providing every
+#   method even when only one is exercised.
+#
+# - **racy-test-coverage**: a `break` inside the stdin/stdout loop whose
+#   coverage depends on writer-task scheduling. Exercised under
+#   `cargo test` most of the time but not deterministically under
+#   `cargo llvm-cov` which inserts extra synchronisation.
+
+# --- agent-broker/src/cursor.rs ------------------------------------------
+crates/agent-broker/src/cursor.rs:174  # platform-conditional: $HOME-unset / USERPROFILE fallback
+crates/agent-broker/src/cursor.rs:175  # platform-conditional
+crates/agent-broker/src/cursor.rs:176  # platform-conditional
+crates/agent-broker/src/cursor.rs:177  # platform-conditional
+crates/agent-broker/src/cursor.rs:178  # platform-conditional
+crates/agent-broker/src/cursor.rs:179  # platform-conditional
+crates/agent-broker/src/cursor.rs:180  # platform-conditional
+crates/agent-broker/src/cursor.rs:181  # platform-conditional: final bail!()
+
+# --- agent-broker/src/github.rs ------------------------------------------
+crates/agent-broker/src/github.rs:327   # dead-defensive-transport
+crates/agent-broker/src/github.rs:1665  # brace-attribution
+
+# --- agent-broker/src/token_cache.rs -------------------------------------
+crates/agent-broker/src/token_cache.rs:75   # platform-conditional: dirs::home_dir() None requires no /etc/passwd entry
+crates/agent-broker/src/token_cache.rs:76   # platform-conditional
+crates/agent-broker/src/token_cache.rs:77   # platform-conditional
+crates/agent-broker/src/token_cache.rs:78   # platform-conditional
+crates/agent-broker/src/token_cache.rs:119  # brace-attribution
+crates/agent-broker/src/token_cache.rs:131  # platform-conditional: chmod 0600 EPERM on file we just created (root never sees this)
+crates/agent-broker/src/token_cache.rs:132  # platform-conditional
+crates/agent-broker/src/token_cache.rs:133  # platform-conditional
+crates/agent-broker/src/token_cache.rs:134  # platform-conditional
+crates/agent-broker/src/token_cache.rs:322  # dead-defensive-test-panic: `other => panic!` arm (BrokerError::Other always matches)
+crates/agent-broker/src/token_cache.rs:334  # dead-defensive-test-panic
+crates/agent-broker/src/token_cache.rs:352  # dead-defensive-test-panic
+crates/agent-broker/src/token_cache.rs:367  # dead-defensive-test-panic
+crates/agent-broker/src/token_cache.rs:385  # dead-defensive-test-panic
+crates/agent-broker/src/token_cache.rs:397  # dead-defensive-test-panic
+
+# --- agent-cli/src/lib.rs ------------------------------------------------
+crates/agent-cli/src/lib.rs:178  # shim-fn-real-io: `pub fn run() { runners::run() }`
+crates/agent-cli/src/lib.rs:179  # shim-fn-real-io
+crates/agent-cli/src/lib.rs:180  # shim-fn-real-io
+crates/agent-cli/src/lib.rs:250  # brace-attribution
+
+# --- agent-mcp/src/channel.rs --------------------------------------------
+# 94-98: `pub async fn run` — wires real stdin / stdout into run_io.
+crates/agent-mcp/src/channel.rs:94  # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:95  # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:96  # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:97  # shim-fn-real-io
+crates/agent-mcp/src/channel.rs:98  # shim-fn-real-io
+# 137-140: the inner `if let Err(e) = ...; tracing::warn!(...)` of the
+# spawned ws_task closure. We can't hit it deterministically because
+# ws_task may complete before stdin EOF in the test.
+crates/agent-mcp/src/channel.rs:137  # racy-test-coverage
+crates/agent-mcp/src/channel.rs:138  # racy-test-coverage
+crates/agent-mcp/src/channel.rs:139  # racy-test-coverage
+crates/agent-mcp/src/channel.rs:140  # racy-test-coverage
+# 159-162: `if out_tx.send(s).is_err() { break }` — same racy writer-
+# dropped path as stdio.rs's equivalent below.
+crates/agent-mcp/src/channel.rs:159  # racy-test-coverage
+crates/agent-mcp/src/channel.rs:160  # racy-test-coverage
+crates/agent-mcp/src/channel.rs:162  # racy-test-coverage
+# 242-262: CollectSink / StubBroker test-mock impl methods exercised
+# only via the equivalent stdio.rs `process_line_drives_broker_through_every_tool`
+# test (channel mode reuses the same broker dispatch path).
+crates/agent-mcp/src/channel.rs:242  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:243  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:244  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:245  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:246  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:247  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:254  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:255  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:256  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:257  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:259  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:260  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:262  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:263  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:265  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:266  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:268  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:269  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:271  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:272  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:274  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:275  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:277  # test-helper-uncalled-method
+
+# --- agent-mcp/src/stdio.rs ----------------------------------------------
+crates/agent-mcp/src/stdio.rs:102  # racy-test-coverage: `if out_tx.send(s).is_err() { break }` after writer task error
+crates/agent-mcp/src/stdio.rs:103  # racy-test-coverage
+crates/agent-mcp/src/stdio.rs:114  # shim-fn-real-io: `pub async fn run` wires real stdin/stdout
+crates/agent-mcp/src/stdio.rs:115  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:116  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:117  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:118  # shim-fn-real-io
+crates/agent-mcp/src/stdio.rs:296  # test-helper-uncalled-method: ErroringWriter::poll_shutdown
+crates/agent-mcp/src/stdio.rs:297  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:298  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:299  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:300  # test-helper-uncalled-method
+crates/agent-mcp/src/stdio.rs:301  # test-helper-uncalled-method
+
+# 486-488: ErroringWriter::poll_flush — never reached because poll_write
+# errors first and the writer task breaks before calling flush().
+crates/agent-mcp/src/channel.rs:486  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:487  # test-helper-uncalled-method
+crates/agent-mcp/src/channel.rs:488  # test-helper-uncalled-method
+
+# --- agent-mcp/src/watched_issues.rs -------------------------------------
+crates/agent-mcp/src/watched_issues.rs:129  # brace-attribution
+crates/agent-mcp/src/watched_issues.rs:180  # brace-attribution
+crates/agent-mcp/src/watched_issues.rs:213  # brace-attribution

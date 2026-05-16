@@ -302,4 +302,99 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     }
+
+    #[test]
+    fn default_path_returns_some_path_when_home_set() {
+        // dirs::home_dir() returns Some on any sane Linux host; this just
+        // exercises the happy path of `default_path` (lines 73 / 79-80).
+        let p = default_path().expect("HOME should resolve in test env");
+        assert!(p.ends_with(".cc-relay/token"));
+    }
+
+    #[test]
+    fn load_returns_other_error_when_read_fails() {
+        // Passing a directory path makes `std::fs::read` fail with EISDIR
+        // — covers the `Err(e)` non-NotFound arm.
+        let dir = tempdir();
+        let err = load(&dir.path).unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("read token cache")),
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_returns_other_error_on_parse_failure() {
+        let dir = tempdir();
+        let path = dir.path.join("bad.json");
+        std::fs::write(&path, b"not-json").unwrap();
+        let err = load(&path).unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("parse token cache")),
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_returns_error_when_parent_create_fails() {
+        // Make the would-be parent an existing regular file → create_dir_all
+        // fails with NotADirectory.
+        let dir = tempdir();
+        let blocker = dir.path.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        // path is `<blocker>/inner/token` — parent is `<blocker>/inner`
+        // whose own parent (`<blocker>`) is a regular file, so create_dir_all
+        // fails.
+        let path = blocker.join("inner").join("token");
+        let err = save(&path, &sample(1)).unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("create dir")),
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_returns_error_when_tmp_write_fails() {
+        // Pre-create a directory at the tmp path so std::fs::write fails
+        // (cannot overwrite a directory with a regular file).
+        let dir = tempdir();
+        let path = dir.path.join("token");
+        let tmp = path.with_extension("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let err = save(&path, &sample(1)).unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("write tmp")),
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_returns_error_when_rename_fails() {
+        // Pre-create `path` as a non-empty directory: write will succeed
+        // (tmp is a sibling file), chmod will succeed, but rename(tmp ->
+        // path) fails because rename of a file over a non-empty dir
+        // returns ENOTEMPTY/EISDIR.
+        let dir = tempdir();
+        let path = dir.path.join("token");
+        std::fs::create_dir_all(&path).unwrap();
+        // Make the directory non-empty so rename can never succeed.
+        std::fs::write(path.join("decoy"), b"x").unwrap();
+        let err = save(&path, &sample(1)).unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("rename")),
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_returns_other_error_when_remove_fails() {
+        // remove_file on a directory returns EISDIR (not NotFound), so
+        // we hit the third arm of the match.
+        let dir = tempdir();
+        let err = delete(&dir.path).unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("remove")),
+            other => panic!("expected Other(_), got {other:?}"),
+        }
+    }
 }

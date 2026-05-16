@@ -1,0 +1,65 @@
+# Files that the coverage gate enforces 100% line coverage on. Same
+# shape as `ippoan/ci-workflows`'s frontend-ci.yml `coverage_100.toml`,
+# adapted for Rust workspaces. New PRs must keep every listed file at
+# 100% line coverage (modulo the carve-outs in
+# `scripts/coverage_allowlist.txt`).
+#
+# Files NOT listed here (e.g. `crates/agent-cli/src/main.rs`,
+# `crates/agent-cli/src/runners.rs`) are excluded by
+# `--ignore-filename-regex` in `scripts/coverage_gate.sh` — they are
+# 1-3 line shims that wire real I/O into testable cores.
+
+# NOTE: trait-only files (`agent-broker/src/broker.rs`) and pure
+# re-export `lib.rs` (`agent-core/src/lib.rs`, `agent-core/src/inbox.rs`
+# while empty) are not emitted by `llvm-cov` because they contain no
+# executable code paths. They are intentionally absent from the list
+# below and would cause "registered but not present in coverage.txt"
+# errors otherwise.
+
+[[files]]
+path = "crates/agent-broker/src/auth.rs"
+
+[[files]]
+path = "crates/agent-broker/src/cursor.rs"
+
+[[files]]
+path = "crates/agent-broker/src/github.rs"
+
+[[files]]
+path = "crates/agent-broker/src/introspect.rs"
+
+[[files]]
+path = "crates/agent-broker/src/lib.rs"
+
+[[files]]
+path = "crates/agent-broker/src/token_cache.rs"
+
+[[files]]
+path = "crates/agent-broker/src/token_manager.rs"
+
+[[files]]
+path = "crates/agent-broker/src/types.rs"
+
+[[files]]
+path = "crates/agent-cli/src/config.rs"
+
+[[files]]
+path = "crates/agent-cli/src/lib.rs"
+
+[[files]]
+path = "crates/agent-core/src/protocol.rs"
+
+[[files]]
+path = "crates/agent-mcp/src/channel.rs"
+
+[[files]]
+path = "crates/agent-mcp/src/lib.rs"
+
+[[files]]
+path = "crates/agent-mcp/src/relay.rs"
+
+[[files]]
+path = "crates/agent-mcp/src/stdio.rs"
+
+[[files]]
+path = "crates/agent-mcp/src/watched_issues.rs"
