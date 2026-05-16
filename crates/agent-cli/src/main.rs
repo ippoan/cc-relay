@@ -26,6 +26,25 @@ use agent_mcp::relay::{run as relay_run, RelayConfig, RelayServer};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod config;
+
+/// Manual argv scan for `--config <path>` / `--config=<path>`. Used
+/// before `Cli::parse()` so the TOML loader can run first. Returns
+/// `None` if the flag is absent or its value is missing (clap will
+/// emit the proper error during parse anyway).
+fn scan_argv_for_config_flag() -> Option<std::path::PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--config" {
+            return args.next().map(std::path::PathBuf::from);
+        }
+        if let Some(rest) = a.strip_prefix("--config=") {
+            return Some(std::path::PathBuf::from(rest));
+        }
+    }
+    None
+}
+
 /// CLI entry point. Subcommands dispatch into `agent-mcp` or the
 /// auth-worker client.
 #[derive(Debug, Parser)]
@@ -35,8 +54,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "info", env = "CC_RELAY_LOG")]
     log_level: String,
 
-    /// Path to a TOML config file. Wired in #11; currently accepted
-    /// and ignored so hooks can pass it through unconditionally.
+    /// Path to a TOML config file. Default location:
+    /// `~/.config/cc-relay/config.toml` (override via `CC_RELAY_CONFIG`).
+    /// Precedence: CLI flag > shell env > TOML > clap default. See
+    /// `crates/agent-cli/src/config.rs` for the schema.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -87,7 +108,7 @@ struct StdioArgs {
     broker_issue: u64,
 
     /// Agent id this binary advertises in `Broker::join` etc.
-    #[arg(long, default_value = "stdio-agent")]
+    #[arg(long, env = "CC_RELAY_AGENT_ID", default_value = "stdio-agent")]
     agent_id: String,
 }
 
@@ -130,7 +151,7 @@ struct RelayArgs {
     /// Agent id this binary advertises in `Broker::join` etc. Defaults to
     /// `host-broker`. The Phase C tool surface (`cc_relay_list_agents`) does
     /// not call `join`, but later tools (`notify_agent`) will.
-    #[arg(long, default_value = "host-broker")]
+    #[arg(long, env = "CC_RELAY_AGENT_ID", default_value = "host-broker")]
     agent_id: String,
 }
 
@@ -166,7 +187,7 @@ struct ChannelArgs {
     broker_issue: u64,
 
     /// Agent id this binary advertises in `Broker::join` etc.
-    #[arg(long, default_value = "host-broker")]
+    #[arg(long, env = "CC_RELAY_AGENT_ID", default_value = "host-broker")]
     agent_id: String,
 }
 
@@ -197,6 +218,28 @@ struct AuthArgs {
 }
 
 fn main() -> ExitCode {
+    // P10 #11 Phase 11.2: load TOML config (if any) BEFORE clap parses
+    // so its env-fallback (`#[arg(env = "...")]`) sees TOML-derived
+    // values. Precedence becomes CLI > shell env > TOML > clap default.
+    //
+    // We do a manual argv scan for `--config <path>` because `Cli::parse()`
+    // hasn't run yet. This is intentional: a chicken-and-egg otherwise.
+    let config_path_override = scan_argv_for_config_flag();
+    let toml_path = config_path_override.or_else(config::default_path);
+    if let Some(path) = toml_path.as_ref() {
+        match config::load(path) {
+            Ok(Some(cfg)) => config::apply_env_from_toml(&cfg),
+            Ok(None) => {} // file does not exist — silent
+            Err(e) => {
+                eprintln!(
+                    "rust-mcp-agent: config load failed at {}: {e:#}",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let cli = Cli::parse();
 
     if let Err(e) = init_tracing(&cli.log_level) {
@@ -205,9 +248,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(path) = &cli.config {
-        // #11 will load this. For now we just acknowledge it so hooks
-        // can pass --config unconditionally without breaking.
-        tracing::info!(config = %path.display(), "config file accepted but not yet read (#11)");
+        tracing::debug!(config = %path.display(), "config file applied (P10 #11 Phase 11.2)");
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
