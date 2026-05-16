@@ -17,7 +17,6 @@ env:
 jobs:
   rust:
     name: rust (${{ matrix.kind }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -76,7 +75,6 @@ jobs:
   # push won't surface a surprise build failure.
   release-build:
     name: release-build (${{ matrix.target }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
