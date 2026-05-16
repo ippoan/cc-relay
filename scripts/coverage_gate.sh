@@ -26,11 +26,11 @@ cd "$(dirname "$0")/.."
 IGNORE_REGEX='crates/agent-cli/src/(main|runners)\.rs|crates/agent-mcp/src/(relay_ws|channel_ws)\.rs'
 
 # Two-call pattern: run tests + collect raw profdata first, then ask
-# `cargo llvm-cov report` for both the human-readable summary and the
-# per-line annotated source. Combining `--text` with the test run on
-# the first call only emits per-line text into stdout interleaved with
-# test runner output on some `cargo-llvm-cov` versions — invoking
-# `report --text` separately produces a deterministic file.
+# `cargo llvm-cov report` for both the summary and the per-line
+# annotated source. `--output-path` is used instead of shell redirection
+# because some cargo-llvm-cov versions on CI emit the text body via
+# `llvm-cov`'s own writer and shell redirection ends up with an empty
+# file.
 cargo llvm-cov --workspace --all-features --no-fail-fast --no-report
 
 cargo llvm-cov report --summary-only \
@@ -39,7 +39,13 @@ cargo llvm-cov report --summary-only \
 
 cargo llvm-cov report --text \
     --ignore-filename-regex "$IGNORE_REGEX" \
-    > coverage.txt
+    --output-path coverage.txt
+
+# Debug aid: surface the size of coverage.txt so future CI failures
+# diagnose faster.
+echo "coverage.txt size: $(wc -c < coverage.txt) bytes, $(wc -l < coverage.txt) lines"
+echo "  first 3 paths seen:"
+grep -oE '^/[^:]+\.rs:' coverage.txt | head -3 || echo "  (none)"
 
 echo
 echo "=== uncovered source lines (line count == 0) ==="
