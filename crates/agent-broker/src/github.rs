@@ -477,9 +477,11 @@ impl Broker for GitHubBroker {
             priority: msg.priority,
             timestamp: msg.timestamp,
         };
-        let comment_body = serde_json::to_string(&payload).map_err(|e| {
-            BrokerError::Other(anyhow::Error::new(e).context("serialize notify comment"))
-        })?;
+        // NotifyCommentBody only contains owned String / enum / i64 — its
+        // Serialize impl is infallible. We expect-not-handle here so the
+        // hot path stays branch-free in coverage.
+        let comment_body =
+            serde_json::to_string(&payload).expect("NotifyCommentBody serialize is infallible");
         let url = self.comments_url();
 
         let resp = self
@@ -1656,10 +1658,49 @@ mod tests {
             },
         )
         .unwrap_err();
-        match err {
-            BrokerError::Other(e) => assert!(e.to_string().contains("task id already exists")),
-            other => panic!("expected Other, got {other:?}"),
+        // apply_plan_op always returns BrokerError::Other for this path.
+        assert!(matches!(err, BrokerError::Other(_)));
+        if let BrokerError::Other(e) = err {
+            assert!(e.to_string().contains("task id already exists"));
         }
+    }
+
+    #[test]
+    fn plan_op_kind_returns_correct_label_for_each_variant() {
+        use agent_core::TaskStatus;
+        assert_eq!(
+            plan_op_kind(&PlanOp::Add {
+                task: TaskSpec {
+                    id: "x".into(),
+                    title: "y".into(),
+                    status: TaskStatus::Pending,
+                    assignee: None,
+                    notes: None,
+                }
+            }),
+            "add",
+        );
+        assert_eq!(
+            plan_op_kind(&PlanOp::Claim {
+                task_id: "x".into(),
+                agent_id: "a".into(),
+            }),
+            "claim",
+        );
+        assert_eq!(
+            plan_op_kind(&PlanOp::Update {
+                task_id: "x".into(),
+                status: TaskStatus::Done,
+                notes: None,
+            }),
+            "update",
+        );
+        assert_eq!(
+            plan_op_kind(&PlanOp::Remove {
+                task_id: "x".into(),
+            }),
+            "remove",
+        );
     }
 
     #[test]

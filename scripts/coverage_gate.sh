@@ -2,33 +2,28 @@
 # Coverage gate: enforce that no source line in the workspace has zero
 # execution count.
 #
-# `cargo-llvm-cov`'s region-based percentage can dip below 100% even
-# when every source line *did* execute, because llvm-cov assigns
-# multi-region lines (e.g. `.map_err(|e| ...)` closure bodies, or the
-# closing `}` of an `if let Some(...) { }` chained off `?`) to a single
-# line and reports the line as partial when only one region fires. The
-# user-visible question — "is there a source line we never ran?" — is
-# best answered by `cargo llvm-cov report --text`, where each source
-# line gets one count column. We grep for `0|` in that column.
+# Two-layer check (matches `ippoan/ci-workflows`'s `coverage_100.toml`
+# convention adapted for Rust):
 #
-# Files on the IGNORE_REGEX list are skipped:
-#   - `crates/agent-cli/src/main.rs` — 3-line shim (`fn main() { run() }`).
-#   - `crates/agent-cli/src/runners.rs` — the runtime shims that call
-#     `agent_mcp::stdio::run` (real stdin loop), `agent_mcp::relay::run`
-#     (real WebSocket), `auth::start_device_authorization` (real HTTP).
-#     The bodies are dependency construction; the testable cores live in
-#     `agent-mcp/src/{stdio,channel,relay}.rs` and `agent-broker/src/auth.rs`.
+#   1. Files listed in `coverage_100.toml` MUST be at 100% — every
+#      source line in each listed file has to execute at least once
+#      under `cargo test --workspace`.
+#   2. The per-line allowlist (`scripts/coverage_allowlist.txt`) is the
+#      explicit, reviewer-visible record of "this line cannot be hit by
+#      a unit test" (llvm-cov brace-attribution artifacts, defensive
+#      transport-error arms that reqwest never produces, etc.).
 #
-# Lines on the per-file allowlist (`scripts/coverage_allowlist.txt`)
-# are also tolerated. Each entry is "<relpath>:<line>" with a `# reason`
-# comment. The allowlist is the documented record of "this line cannot
-# be hit by a unit test"; reviewers should push back when it grows.
+# Files NOT in `coverage_100.toml` are excluded entirely by
+# `--ignore-filename-regex`. They are 1-3 line shims that wire real I/O
+# (`tokio::io::stdin`, `tokio_tungstenite::connect_async`, the binary
+# entry point) into a testable inner core that lives in another file.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-IGNORE_REGEX='crates/agent-cli/src/(main|runners)\.rs'
+# Files NOT enforced — shim files only.
+IGNORE_REGEX='crates/agent-cli/src/(main|runners)\.rs|crates/agent-mcp/src/(relay_ws|channel_ws)\.rs'
 
 cargo llvm-cov --workspace --all-features --no-fail-fast \
     --ignore-filename-regex "$IGNORE_REGEX" \
@@ -43,13 +38,15 @@ echo
 echo "=== uncovered source lines (line count == 0) ==="
 
 ALLOWLIST="${PWD}/scripts/coverage_allowlist.txt"
-export ALLOWLIST
+COVERAGE_100="${PWD}/coverage_100.toml"
+export ALLOWLIST COVERAGE_100
 
 python3 - <<'PY'
 import os
 import re
 import sys
 
+# ---- parse allowlist ----
 allowlist = set()
 allowlist_path = os.environ.get("ALLOWLIST", "")
 if allowlist_path and os.path.exists(allowlist_path):
@@ -58,18 +55,26 @@ if allowlist_path and os.path.exists(allowlist_path):
             line = raw.split("#", 1)[0].strip()
             if not line:
                 continue
-            # Format: "<rel-path>:<line>" — single line numbers only.
             allowlist.add(line)
 
+# ---- parse coverage_100.toml ----
+required_files = set()
+cov100_path = os.environ.get("COVERAGE_100", "")
+if cov100_path and os.path.exists(cov100_path):
+    with open(cov100_path) as f:
+        for raw in f:
+            m = re.match(r'^\s*path\s*=\s*"(.+)"\s*$', raw)
+            if m:
+                required_files.add(m.group(1))
+
+# ---- parse llvm-cov text ----
 with open("coverage.txt") as f:
     raw = f.read()
-
-# Split by per-file headers — `cargo llvm-cov ... --text` prefixes each
-# file's annotated source with `<absolute_path>:` on its own line.
 parts = re.split(r'^(/[^\n:]+\.rs):\n', raw, flags=re.M)
 
 uncovered_total = 0
 files_with_uncov = []
+files_seen = set()
 
 for i in range(1, len(parts), 2):
     path = parts[i]
@@ -79,6 +84,7 @@ for i in range(1, len(parts), 2):
         continue
 
     rel = path.split("/cc-relay/")[-1] if "/cc-relay/" in path else path
+    files_seen.add(rel)
 
     uncov = []
     for line in body.split("\n"):
@@ -94,11 +100,31 @@ for i in range(1, len(parts), 2):
         uncovered_total += len(uncov)
         files_with_uncov.append((rel, uncov))
 
+# ---- check coverage_100.toml files were seen ----
+missing_required = required_files - files_seen
+if missing_required:
+    for rel in sorted(missing_required):
+        print(
+            f"::error file={rel}::registered in coverage_100.toml but "
+            f"not present in coverage.txt — has the file been deleted "
+            f"or moved?"
+        )
+    sys.exit(1)
+
+# ---- report ----
 if files_with_uncov:
+    fail_required = []
+    fail_other = []
     for rel, uncov in files_with_uncov:
         head = ", ".join(str(n) for n in uncov[:25])
         more = f" (+{len(uncov) - 25} more)" if len(uncov) > 25 else ""
-        print(f"::error file={rel}::uncovered lines: {head}{more}")
+        msg = f"::error file={rel}::uncovered lines: {head}{more}"
+        if rel in required_files:
+            fail_required.append(msg)
+        else:
+            fail_other.append(msg)
+    for m in fail_required + fail_other:
+        print(m)
     print(
         f"\n{uncovered_total} uncovered source lines across "
         f"{len(files_with_uncov)} files — coverage gate FAILED"
@@ -106,7 +132,7 @@ if files_with_uncov:
     sys.exit(1)
 
 print(
-    f"all source lines executed at least once "
-    f"({len(allowlist)} allowlist entries) — coverage gate PASSED"
+    f"all {len(required_files)} coverage_100.toml files at 100%, "
+    f"with {len(allowlist)} documented allowlist entries — coverage gate PASSED"
 )
 PY

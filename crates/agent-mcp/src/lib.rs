@@ -27,8 +27,33 @@
 //! `update_task`, `remove_task`.
 
 pub mod channel;
+pub mod channel_ws;
 pub mod relay;
+pub mod relay_ws;
 pub mod stdio;
 pub mod watched_issues;
 
 pub use relay::{RelayConfig, RelayServer};
+pub use relay_ws::run as relay_run;
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    /// Install a tracing subscriber for the current process, exactly
+    /// once. See `agent_broker::test_utils::init_tracing` for rationale.
+    pub(crate) fn init_tracing() {
+        use std::sync::OnceLock;
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::TRACE)
+                .try_init();
+        });
+    }
+
+    #[test]
+    fn init_tracing_is_idempotent() {
+        init_tracing();
+        init_tracing();
+    }
+}

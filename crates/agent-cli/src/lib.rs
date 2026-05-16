@@ -241,14 +241,12 @@ mod tests {
             "1",
         ])
         .expect("parse");
-        match cli.cmd {
-            Cmd::Stdio(a) => {
-                assert_eq!(a.broker_repo, "o/r");
-                assert_eq!(a.broker_token, "tok");
-                assert_eq!(a.broker_issue, 1);
-                assert_eq!(a.agent_id, "stdio-agent");
-            }
-            _ => panic!("expected stdio"),
+        assert!(matches!(&cli.cmd, Cmd::Stdio(_)));
+        if let Cmd::Stdio(a) = cli.cmd {
+            assert_eq!(a.broker_repo, "o/r");
+            assert_eq!(a.broker_token, "tok");
+            assert_eq!(a.broker_issue, 1);
+            assert_eq!(a.agent_id, "stdio-agent");
         }
     }
 

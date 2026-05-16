@@ -37,12 +37,10 @@ use agent_core::{NotifyMessage, NotifyTarget, PlanOp, Priority, TaskSpec, TaskSt
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::watched_issues::{IssueEventsFile, IssueKey, WatchedIssuesFile};
@@ -54,12 +52,12 @@ pub const STUB_PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Frame schema version (binary side `github-mcp-server-rs#27` and auth-worker
 /// `mcp-session-do.ts:FRAME_VERSION` both pin to 1).
-const FRAME_VERSION: u32 = 1;
+pub(crate) const FRAME_VERSION: u32 = 1;
 
 /// Server name advertised in `initialize`. Matches `cc-relay` in the
 /// `.mcp.json` server entry to keep tool namespace prefixes intuitive.
 const SERVER_NAME: &str = "cc-relay";
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// ADR-005: instructions added to Claude's system prompt when running as a
 /// Channel. Tells Claude how to recognize the `<channel>` tag emitted by
@@ -75,11 +73,11 @@ const CHANNEL_INSTRUCTIONS: &str = "GitHub webhook events arrive as \
 
 /// Outbound `hello` frame (us → DO) sent immediately after WS upgrade.
 #[derive(Debug, Clone, Serialize)]
-struct HelloFrame {
-    kind: &'static str,
-    v: u32,
-    binary_version: &'static str,
-    proto: u32,
+pub(crate) struct HelloFrame {
+    pub(crate) kind: &'static str,
+    pub(crate) v: u32,
+    pub(crate) binary_version: &'static str,
+    pub(crate) proto: u32,
 }
 
 /// Inbound `req` frame (DO → us) per Claude.ai-originated `POST /mcp`.
@@ -285,13 +283,9 @@ impl RelayServer {
                     },
                 },
             });
-            match serde_json::to_string(&notif) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "channel notification serialize failed");
-                    return;
-                }
-            }
+            // `notif` only contains `serde_json::Value` and owned `&str`,
+            // whose Serialize impls are infallible.
+            serde_json::to_string(&notif).expect("notif JSON serialize is infallible")
         } else {
             // ADR-004 Phase D (legacy): auth-worker McpSession DO に
             // `kind:"notif"` frame で MCP `notifications/message` を back-pipe。
@@ -311,13 +305,9 @@ impl RelayServer {
                 "v": FRAME_VERSION,
                 "body": notif_body,
             });
-            match serde_json::to_string(&frame) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "notif frame serialize failed");
-                    return;
-                }
-            }
+            // Same rationale as the channel-mode branch above —
+            // `serde_json::Value` serialize is infallible.
+            serde_json::to_string(&frame).expect("notif frame JSON serialize is infallible")
         };
         if let Err(e) = tx.send(payload) {
             tracing::warn!(error = %e, "notif send failed (writer dropped)");
@@ -905,74 +895,8 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// Connect to the relay WS and pump frames forever.
-///
-/// Loops on inbound `req` frames; per frame, decodes the body, runs
-/// [`RelayServer::handle_jsonrpc`], and sends back a `resp` frame. Returns
-/// only when the WS closes (caller decides whether to reconnect).
-///
-/// ADR-004 Phase D: WS への送信は全て mpsc channel 経由にする。
-/// `handle_event_frame` も同じ channel で `kind:"notif"` frame を流すので、
-/// reader loop と event handler が同じ sink を奪い合う race を避ける。
-pub async fn run(mut server: RelayServer, config: RelayConfig) -> Result<()> {
-    let mut request = config
-        .ws_url
-        .as_str()
-        .into_client_request()
-        .with_context(|| format!("invalid ws url: {}", config.ws_url))?;
-    request.headers_mut().insert(
-        "Authorization",
-        HeaderValue::from_str(&format!("Bearer {}", config.access_token))
-            .context("invalid bearer token (non-ascii chars)")?,
-    );
-
-    tracing::info!(url = %config.ws_url, "agent-mcp relay: connecting");
-    let (ws, http_resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .with_context(|| format!("ws connect failed: {}", config.ws_url))?;
-    tracing::info!(status = %http_resp.status(), "agent-mcp relay: connected");
-
-    let (mut sink, mut stream) = ws.split();
-
-    // ADR-004 Phase D: 送信は全部 channel 経由。handle_event_frame からも
-    // back-pipe する notif frame を流すため。writer は別 task で drain する。
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-    server.set_notif_sender(out_tx.clone());
-
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Err(e) = sink.send(Message::Text(msg)).await {
-                tracing::warn!(error = %e, "ws sink write failed; closing writer");
-                break;
-            }
-        }
-        // sink を flush + close。drop だけだと TCP RST になる事があるので明示。
-        let _ = sink.close().await;
-    });
-
-    // hello frame — informational, DO ignores it for Phase 6/7 but logs it.
-    let hello = HelloFrame {
-        kind: "hello",
-        v: FRAME_VERSION,
-        binary_version: SERVER_VERSION,
-        proto: FRAME_VERSION,
-    };
-    out_tx
-        .send(serde_json::to_string(&hello)?)
-        .context("send hello frame failed (writer dead)")?;
-
-    let result = pump_inbound(&server, &mut stream, &out_tx).await;
-
-    // writer task を終了させる: tx を drop すれば channel が close、writer task は
-    // recv() で None を返して抜ける。
-    drop(out_tx);
-    let _ = writer.await;
-
-    result
-}
-
-/// 受信 loop 本体。`run()` から切り出して、writer task の cleanup を 1 箇所に
-/// まとめる。
+/// 受信 loop 本体。real-WS connect prelude は `crate::relay_ws::run` に
+/// 切り出し、ここ (`pump_inbound`) は mock-stream で完全にテスト可能。
 pub(crate) async fn pump_inbound(
     server: &RelayServer,
     stream: &mut (impl StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -1460,6 +1384,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_event_frame_buffers_watched_then_drains() {
+        crate::test_utils::init_tracing();
         let (srv, _tmp) = server_with_tempfiles(StubBroker::with_agents(vec![]));
         let sub = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subscribe_issue_activity","arguments":{"owner":"ippoan","repo":"cc-relay","issue_number":42}}}"#;
         dispatch(&srv, sub).await.unwrap();
@@ -2002,12 +1927,12 @@ mod tests {
         .unwrap();
         let ops = broker.plan_ops.lock().unwrap();
         assert_eq!(ops.len(), 1);
-        let PlanOp::Add { task } = &ops[0] else {
-            panic!("expected Add");
-        };
-        assert!(matches!(task.status, TaskStatus::Pending));
-        assert!(task.assignee.is_none());
-        assert!(task.notes.is_none());
+        assert!(matches!(&ops[0], PlanOp::Add { .. }));
+        if let PlanOp::Add { task } = &ops[0] {
+            assert!(matches!(task.status, TaskStatus::Pending));
+            assert!(task.assignee.is_none());
+            assert!(task.notes.is_none());
+        }
     }
 
     #[tokio::test]
@@ -2400,6 +2325,7 @@ mod tests {
 
     #[test]
     fn handle_event_frame_load_error_drops_frame() {
+        crate::test_utils::init_tracing();
         // Watched path is a directory — load() returns Err.
         let dir = tempfile::tempdir().unwrap();
         let watched_path = dir.path().join("watched.txt");
@@ -2419,6 +2345,7 @@ mod tests {
 
     #[test]
     fn handle_event_frame_unwatched_logs_debug() {
+        crate::test_utils::init_tracing();
         // watched is empty, so frame for unsubscribed issue hits the "unwatched"
         // debug branch (lines 237-241).
         let dir = tempfile::tempdir().unwrap();
@@ -2437,6 +2364,7 @@ mod tests {
 
     #[test]
     fn handle_event_frame_append_error_drops_frame() {
+        crate::test_utils::init_tracing();
         // Watched contains the key, but events path is a directory → append fails.
         let dir = tempfile::tempdir().unwrap();
         let watched = WatchedIssuesFile::new(dir.path().join("watched.txt"));
@@ -2755,7 +2683,7 @@ mod tests {
             ws_url: "not a url".into(),
             access_token: "tok".into(),
         };
-        let err = super::run(server, cfg).await.unwrap_err();
+        let err = crate::relay_ws::run(server, cfg).await.unwrap_err();
         assert!(err.to_string().contains("invalid ws url"), "got: {err}");
     }
 
@@ -2767,7 +2695,7 @@ mod tests {
             // a non-ascii char in the token forces HeaderValue::from_str to fail
             access_token: "tok\u{00e9}".into(),
         };
-        let err = super::run(server, cfg).await.unwrap_err();
+        let err = crate::relay_ws::run(server, cfg).await.unwrap_err();
         assert!(
             err.to_string().contains("invalid bearer token")
                 || err.to_string().contains("ws connect"),

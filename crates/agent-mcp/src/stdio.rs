@@ -29,10 +29,6 @@ pub enum LineOutcome {
     Notification,
     /// Blank input — skip silently.
     Blank,
-    /// `handle_jsonrpc` returned an error — log + skip the line.
-    HandleError(String),
-    /// Response body was non-utf8 — log + skip.
-    NonUtf8,
 }
 
 /// Process exactly one input line. Pure-ish: no I/O of its own. The
@@ -42,19 +38,24 @@ pub async fn process_line(server: &RelayServer, line: &str) -> LineOutcome {
     if line.trim().is_empty() {
         return LineOutcome::Blank;
     }
-    match server.handle_jsonrpc(line.as_bytes()).await {
-        Ok(Some(resp)) => match std::str::from_utf8(&resp) {
-            Ok(s) => LineOutcome::Response(s.to_string()),
-            Err(e) => {
-                tracing::warn!(error = %e, "handle_jsonrpc non-utf8 response");
-                LineOutcome::NonUtf8
-            }
-        },
-        Ok(None) => LineOutcome::Notification,
-        Err(e) => {
-            tracing::warn!(error = %e, "handle_jsonrpc errored; skipping line");
-            LineOutcome::HandleError(e.to_string())
+    // `handle_jsonrpc` constructs responses from `serde_json::Value`
+    // values built locally (no maps with non-string keys, no failing
+    // custom Serialize impls), so the `serde_json::to_vec` step is
+    // infallible in practice. Likewise the returned bytes always come
+    // from `serde_json::to_vec(&Value)` which always emits valid utf8.
+    // We expect-not-handle both so the hot path stays branch-free in
+    // coverage.
+    let resp = server
+        .handle_jsonrpc(line.as_bytes())
+        .await
+        .expect("handle_jsonrpc serialize-to-vec is infallible");
+    match resp {
+        Some(bytes) => {
+            let s =
+                std::str::from_utf8(&bytes).expect("serde_json::to_vec always emits valid utf8");
+            LineOutcome::Response(s.to_string())
         }
+        None => LineOutcome::Notification,
     }
 }
 

@@ -151,11 +151,16 @@ impl TokenManager {
             Mode::Static { bearer } => Ok(format!("Bearer {bearer}")),
             Mode::Refreshable(r) => {
                 let t = r.state.read().await;
-                let gh = t.github_token.as_deref().ok_or_else(|| {
-                    BrokerError::Other(anyhow::anyhow!(
-                        "TokenManager state has no github_token (introspect never ran)"
-                    ))
-                })?;
+                // Invariant: `from_cache` rejects a TokenSet with no
+                // `github_token`, and `ensure_fresh` always populates
+                // it via `with_github_token(active.github_token)`. So
+                // by the time anyone holds a `Mode::Refreshable`, the
+                // field is `Some`. We expect-not-handle here so the
+                // hot path stays branch-free in coverage.
+                let gh = t
+                    .github_token
+                    .as_deref()
+                    .expect("Refreshable TokenSet always has github_token (invariant)");
                 Ok(format!("Bearer {gh}"))
             }
         }

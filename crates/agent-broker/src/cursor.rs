@@ -236,6 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_file_falls_back_to_beginning() {
+        crate::test_utils::init_tracing();
         let dir = tempdir();
         let path = dir.join("corrupt.json");
         tokio::fs::write(&path, b"not-json-at-all").await.unwrap();
@@ -246,6 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_version_falls_back_to_beginning() {
+        crate::test_utils::init_tracing();
         let dir = tempdir();
         let path = dir.join("future.json");
         tokio::fs::write(&path, br#"{"v":99,"last_comment_id":7,"last_etag":"x"}"#)

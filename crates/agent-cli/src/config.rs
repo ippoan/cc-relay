@@ -138,12 +138,41 @@ fn set_if_unset(key: &str, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::io::Write;
 
     fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         f
+    }
+
+    /// Restore an env var to its prior state. Pulled out so both arms
+    /// (`Some` / `None`) can be exercised independently below; the
+    /// inline `match` previously left whichever arm was unused for
+    /// the test's own state as zero-count.
+    fn restore_env(key: &str, prior: Option<OsString>) {
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn restore_env_some_sets_back() {
+        let key = "CC_RELAY_RESTORE_HELPER_SOME";
+        std::env::remove_var(key);
+        restore_env(key, Some(OsString::from("prior-value")));
+        assert_eq!(std::env::var(key).unwrap(), "prior-value");
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn restore_env_none_removes() {
+        let key = "CC_RELAY_RESTORE_HELPER_NONE";
+        std::env::set_var(key, "leftover");
+        restore_env(key, None);
+        assert!(std::env::var_os(key).is_none());
     }
 
     #[test]
@@ -224,10 +253,7 @@ level = "debug"
         apply_env_from_toml(&cfg);
         assert_eq!(std::env::var(key).unwrap(), "from-shell");
         // Restore environment to whatever the test was given.
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
+        restore_env(key, prior);
     }
 
     #[test]
@@ -243,5 +269,39 @@ level = "debug"
         set_if_unset(key, Some("from-toml-2"));
         assert_eq!(std::env::var(key).unwrap(), "shell-wins");
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn default_path_honors_cc_relay_config_env() {
+        let key = "CC_RELAY_CONFIG";
+        let prior = std::env::var_os(key);
+        std::env::set_var(key, "/tmp/explicit-config.toml");
+        let p = default_path().unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/tmp/explicit-config.toml"));
+        restore_env(key, prior);
+    }
+
+    #[test]
+    fn default_path_falls_back_to_home() {
+        // We can't reliably swap HOME in parallel tests, so just assert
+        // that with CC_RELAY_CONFIG unset we get *some* path that ends
+        // in `.config/cc-relay/config.toml` (HOME is set in the
+        // environment by default).
+        let key = "CC_RELAY_CONFIG";
+        let prior = std::env::var_os(key);
+        std::env::remove_var(key);
+        let p = default_path().expect("HOME is always set in test env");
+        assert!(p.ends_with(".config/cc-relay/config.toml"), "got {p:?}");
+        restore_env(key, prior);
+    }
+
+    #[test]
+    fn load_returns_err_on_non_notfound_io_error() {
+        // Pointing `load` at a directory triggers an IO error other
+        // than NotFound on most platforms (EISDIR on Linux).
+        let dir = tempfile::tempdir().unwrap();
+        let err = load(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("read config"), "got: {msg}");
     }
 }

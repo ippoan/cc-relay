@@ -20,7 +20,8 @@ use std::sync::Arc;
 use agent_broker::auth::{self, default_scopes, AuthConfig};
 use agent_broker::{introspect, token_cache, Broker, CursorStore, GitHubBroker};
 use agent_mcp::channel::run as channel_run;
-use agent_mcp::relay::{run as relay_run, RelayConfig, RelayServer};
+use agent_mcp::relay::{RelayConfig, RelayServer};
+use agent_mcp::relay_run;
 use anyhow::{Context, Result};
 
 use crate::{parse_owner_repo, resolve_token_path, AuthArgs, ChannelArgs, RelayArgs, StdioArgs};

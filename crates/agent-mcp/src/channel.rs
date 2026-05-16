@@ -18,13 +18,11 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::relay::{RelayConfig, RelayServer};
@@ -136,7 +134,7 @@ where
     let ws_url = config.ws_url.clone();
     let ws_token = config.access_token.clone();
     let ws_task = tokio::spawn(async move {
-        if let Err(e) = pump_ws_events(&ws_server, &ws_url, &ws_token).await {
+        if let Err(e) = crate::channel_ws::pump_ws_events(&ws_server, &ws_url, &ws_token).await {
             tracing::warn!(error = %e, "ws event pump exited");
         }
     });
@@ -176,26 +174,6 @@ where
     drop(server);
     let _ = writer_task.await;
     Ok(())
-}
-
-/// Outbound WS receive loop. Connects, sends hello, then routes every
-/// inbound frame through [`handle_ws_message`].
-async fn pump_ws_events(server: &Arc<RelayServer>, ws_url: &str, token: &str) -> Result<()> {
-    let mut request = ws_url
-        .into_client_request()
-        .with_context(|| format!("invalid ws url: {ws_url}"))?;
-    request.headers_mut().insert(
-        "Authorization",
-        HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("invalid bearer token (non-ascii chars)")?,
-    );
-    tracing::info!(url = %ws_url, "channel: connecting auth-worker ws");
-    let (ws, http_resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .with_context(|| format!("ws connect failed: {ws_url}"))?;
-    tracing::info!(status = %http_resp.status(), "channel: ws connected");
-    let (sink, stream) = ws.split();
-    drive_ws_pump(server, sink, stream).await
 }
 
 /// Stream-driven WS pump split out for testability. Generic over Sink /
@@ -458,7 +436,7 @@ mod tests {
         // path of pump_ws_events directly we just call connect with a
         // garbage url here in a tokio task and assert it errors.
         let s = Arc::new(server());
-        let err = super::pump_ws_events(&s, "not-a-url", "tok")
+        let err = crate::channel_ws::pump_ws_events(&s, "not-a-url", "tok")
             .await
             .unwrap_err();
         assert!(
@@ -472,7 +450,7 @@ mod tests {
         // The bearer token interpolation goes through HeaderValue::from_str
         // which rejects non-ascii. wss:// is fine syntactically.
         let s = Arc::new(server());
-        let err = super::pump_ws_events(&s, "wss://example.invalid/x", "héllo")
+        let err = crate::channel_ws::pump_ws_events(&s, "wss://example.invalid/x", "héllo")
             .await
             .unwrap_err();
         let msg = err.to_string();
