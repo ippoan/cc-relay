@@ -13,7 +13,7 @@ name: branch-protection-drift
 # produces them correctly. The annotation + Job Summary stay visible
 # for operator review until the reusable is improved to aggregate
 # across the most recent N commits (or query workflow_runs by id),
-# at which point this flag can be removed.
+# at which point this flag should be removed.
 
 on:
   pull_request:
@@ -36,28 +36,9 @@ permissions:
 
 jobs:
   drift:
+    # See file header for why this is non-blocking right now.
+    continue-on-error: true
     uses: ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml@main
     permissions:
       contents: read
       checks: read
-
-  # Surface the drift reusable's outcome as a separate non-blocking job
-  # so the PR can merge while the bootstrap-time false-positive (see
-  # file header) is being resolved. Once the reusable is upgraded this
-  # whole `drift-advisory` job and `continue-on-error` can be dropped
-  # and `drift` itself can gate merges.
-  drift-advisory:
-    needs: drift
-    if: always()
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Report drift outcome (non-blocking)
-        env:
-          OUTCOME: ${{ needs.drift.result }}
-        run: |
-          set -euo pipefail
-          echo "drift reusable outcome: $OUTCOME"
-          if [ "$OUTCOME" != "success" ]; then
-            echo "::warning::Branch protection drift check did not succeed (outcome=$OUTCOME). See the `drift` job Summary for details. This is non-blocking until the reusable is upgraded to aggregate across multiple commits."
-          fi
