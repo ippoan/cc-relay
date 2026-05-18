@@ -5,30 +5,29 @@
 //! - [`TokenManager::static_token`] — a fixed, never-refreshed bearer
 //!   token. Used by tests and by callers that already have a long-lived
 //!   credential (e.g. a GitHub PAT in env). `ensure_fresh` is a no-op.
-//! - [`TokenManager::from_cache`] — refreshable bundle backed by
-//!   `~/.cc-relay/token`. `ensure_fresh` checks the JWT `expires_at`
-//!   against a 5-minute skew window and, if close, drives
-//!   [`auth::refresh`] → [`introspect`] → [`token_cache::save`] and
-//!   updates the in-memory copy.
+//! - [`TokenManager::from_cache`] — non-refreshable bundle backed by
+//!   `~/.cc-relay/token`. Since auth-worker issue #145 the pair flow
+//!   does not mint refresh tokens, so `ensure_fresh` only validates
+//!   that the JWT is still within its lifetime; if it falls inside the
+//!   5-minute skew window the call returns a `BrokerError::Auth`
+//!   prompting the operator to re-run `rust-mcp-agent auth`.
 //!
-//! Concurrency: `ensure_fresh` may be called from multiple async tasks.
-//! Two simultaneous refreshes are wasteful but not incorrect — the
-//! second one overwrites the first's cache file with an equivalent
-//! `TokenSet` and the in-memory copy converges. Adding a dedupe
-//! `Mutex<()>` is a future optimization.
+//! Concurrency: `ensure_fresh` only reads from the cached `TokenSet`,
+//! so concurrent callers are safe.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::auth::{self, AuthConfig};
-use crate::introspect;
+use crate::auth::AuthConfig;
 use crate::token_cache::{self, TokenSet};
 use crate::types::{BrokerError, Result};
 
-/// How close to expiry the JWT must be before [`ensure_fresh`] refreshes
-/// it. 5 minutes matches the upstream `github-mcp-server-rs` default.
+/// How close to expiry the JWT must be before [`ensure_fresh`] starts
+/// reporting expiry. 5 minutes matches the upstream
+/// `github-mcp-server-rs` default and the previous device-flow refresh
+/// threshold.
 const REFRESH_SKEW_SECS: i64 = 300;
 
 /// Holder of the credential a [`GitHubBroker`](crate::GitHubBroker) uses
@@ -42,27 +41,29 @@ impl std::fmt::Debug for TokenManager {
         // Never log token material. Just say which variant this is.
         match &self.mode {
             Mode::Static { .. } => f.debug_struct("TokenManager::Static").finish(),
-            Mode::Refreshable(_) => f.debug_struct("TokenManager::Refreshable").finish(),
+            Mode::Cached(_) => f.debug_struct("TokenManager::Cached").finish(),
         }
     }
 }
 
 enum Mode {
     Static { bearer: String },
-    // Boxed: RefreshableInner is significantly larger than the Static
-    // variant (RwLock + reqwest::Client + several Strings/PathBufs), so
-    // pay one allocation to keep the discriminant small.
-    Refreshable(Box<RefreshableInner>),
+    // Boxed: `CachedInner` is significantly larger than the Static
+    // variant (RwLock + Strings/PathBufs), so pay one allocation to
+    // keep the discriminant small.
+    Cached(Box<CachedInner>),
 }
 
-// `secret` is `Option<String>`: `Some` → legacy shared-secret mode on
-// `/mcp/introspect`; `None` → Bearer-JWT mode (CLI / end-user default).
-struct RefreshableInner {
+struct CachedInner {
     state: RwLock<TokenSet>,
+    /// Retained for future re-auth flows (operator-visible error
+    /// messages reference the path). Not used to write back since pair
+    /// flow doesn't mint refresh tokens.
     cache_path: PathBuf,
+    /// Retained for symmetry with the previous device-flow design;
+    /// callers may need it when they reissue the JWT via pair flow.
+    #[allow(dead_code)]
     cfg: AuthConfig,
-    secret: Option<String>,
-    http: reqwest::Client,
 }
 
 impl TokenManager {
@@ -76,19 +77,13 @@ impl TokenManager {
         })
     }
 
-    /// Load a [`TokenSet`] from `cache_path` and wrap it in a
-    /// refreshable manager.
+    /// Load a [`TokenSet`] from `cache_path` and wrap it. The cached set
+    /// must already contain a `github_token` (populated by
+    /// `rust-mcp-agent auth` immediately after the JWT was provisioned).
     ///
-    /// Returns an error if the cache file is missing (the user has not
-    /// run `rust-mcp-agent auth` yet) or if the cached set has no
-    /// `github_token` (a prior auth run was interrupted between
-    /// `token` and `introspect`).
-    pub fn from_cache(
-        cache_path: PathBuf,
-        cfg: AuthConfig,
-        secret: Option<String>,
-        http: reqwest::Client,
-    ) -> Result<Arc<Self>> {
+    /// Returns an error if the cache file is missing or the cached set
+    /// is incomplete.
+    pub fn from_cache(cache_path: PathBuf, cfg: AuthConfig) -> Result<Arc<Self>> {
         let set = token_cache::load(&cache_path)?.ok_or_else(|| {
             BrokerError::Auth(format!(
                 "no cached token at {} -- run `rust-mcp-agent auth`",
@@ -102,44 +97,32 @@ impl TokenManager {
             )));
         }
         Ok(Arc::new(Self {
-            mode: Mode::Refreshable(Box::new(RefreshableInner {
+            mode: Mode::Cached(Box::new(CachedInner {
                 state: RwLock::new(set),
                 cache_path,
                 cfg,
-                secret,
-                http,
             })),
         }))
     }
 
-    /// Refresh the access token if it falls within the skew window of
-    /// expiry; otherwise no-op. After this returns `Ok(())`, callers
-    /// may read [`bearer`](Self::bearer) and rely on it being valid for
-    /// at least the next several minutes.
+    /// Verify the cached JWT still has lifetime left. Returns a
+    /// `BrokerError::Auth` (rather than triggering an auto-refresh)
+    /// when the JWT falls within the skew window — pair flow does not
+    /// issue refresh tokens, so the operator must re-run
+    /// `rust-mcp-agent auth`.
     pub async fn ensure_fresh(&self) -> Result<()> {
         let r = match &self.mode {
             Mode::Static { .. } => return Ok(()),
-            Mode::Refreshable(r) => r,
+            Mode::Cached(r) => r,
         };
-
-        let needs_refresh = r.state.read().await.is_expired(REFRESH_SKEW_SECS);
-        if !needs_refresh {
-            return Ok(());
+        let set = r.state.read().await;
+        if set.is_expired(REFRESH_SKEW_SECS) {
+            return Err(BrokerError::Auth(format!(
+                "cached JWT at {} is within {}s of expiry; re-run `rust-mcp-agent auth` to re-pair",
+                r.cache_path.display(),
+                REFRESH_SKEW_SECS
+            )));
         }
-
-        let refresh_token = r.state.read().await.refresh_token.clone();
-        let new_set = auth::refresh(&r.http, &r.cfg, &refresh_token).await?;
-        let active =
-            introspect::introspect(&r.http, &r.cfg, r.secret.as_deref(), &new_set.access_token)
-                .await?
-                .ok_or_else(|| {
-                    BrokerError::Auth(
-                        "refresh succeeded but introspect returned inactive token".into(),
-                    )
-                })?;
-        let new_set = new_set.with_github_token(active.github_token);
-        token_cache::save(&r.cache_path, &new_set)?;
-        *r.state.write().await = new_set;
         Ok(())
     }
 
@@ -149,18 +132,15 @@ impl TokenManager {
     pub async fn bearer(&self) -> Result<String> {
         match &self.mode {
             Mode::Static { bearer } => Ok(format!("Bearer {bearer}")),
-            Mode::Refreshable(r) => {
+            Mode::Cached(r) => {
                 let t = r.state.read().await;
                 // Invariant: `from_cache` rejects a TokenSet with no
-                // `github_token`, and `ensure_fresh` always populates
-                // it via `with_github_token(active.github_token)`. So
-                // by the time anyone holds a `Mode::Refreshable`, the
-                // field is `Some`. We expect-not-handle here so the
-                // hot path stays branch-free in coverage.
+                // `github_token`; once we hand out a `Mode::Cached`
+                // the field is always `Some`.
                 let gh = t
                     .github_token
                     .as_deref()
-                    .expect("Refreshable TokenSet always has github_token (invariant)");
+                    .expect("Cached TokenSet always has github_token (invariant)");
                 Ok(format!("Bearer {gh}"))
             }
         }
@@ -170,12 +150,10 @@ impl TokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn cfg(base: String) -> AuthConfig {
+    fn cfg() -> AuthConfig {
         AuthConfig {
-            base_url: base,
+            base_url: "http://unused".into(),
             client_id: "cc-relay".into(),
             scopes: vec!["mcp.read".into(), "mcp.write".into()],
         }
@@ -184,7 +162,7 @@ mod tests {
     fn sample(expires_at: i64) -> TokenSet {
         TokenSet {
             access_token: "jwt.payload.sig".into(),
-            refresh_token: "rt-1".into(),
+            refresh_token: None,
             scope: "mcp.read mcp.write".into(),
             github_token: Some("gho_initial".into()),
             expires_at,
@@ -217,97 +195,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refreshable_no_refresh_when_fresh() {
-        let server = MockServer::start().await;
-        // The mock would only be hit if a refresh fires. Don't mount any
-        // token / introspect mocks — a request would 404 the test.
+    async fn cached_passes_when_fresh() {
         let now = token_cache::now_secs();
         let path = write_cache(&sample(now + 3600));
-        let m = TokenManager::from_cache(
-            path,
-            cfg(server.uri()),
-            Some("shh".into()),
-            reqwest::Client::new(),
-        )
-        .unwrap();
-
+        let m = TokenManager::from_cache(path, cfg()).unwrap();
         m.ensure_fresh().await.unwrap();
         assert_eq!(m.bearer().await.unwrap(), "Bearer gho_initial");
     }
 
     #[tokio::test]
-    async fn refreshable_refreshes_when_within_skew() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/mcp/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "jwt2.body.sig",
-                "refresh_token": "rt-2",
-                "scope": "mcp.read mcp.write",
-                "expires_in": 3600,
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/mcp/introspect"))
-            .and(header("authorization", "shh"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "active": true,
-                "github_login": "octocat",
-                "github_token": "gho_refreshed",
-                "exp": token_cache::now_secs() + 3600,
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // Cached set is "expired-soon" (within the 300s skew).
+    async fn cached_returns_auth_error_when_within_skew() {
         let now = token_cache::now_secs();
-        let cache_path = write_cache(&sample(now + 60));
-        let m = TokenManager::from_cache(
-            cache_path.clone(),
-            cfg(server.uri()),
-            Some("shh".into()),
-            reqwest::Client::new(),
-        )
-        .unwrap();
-
-        m.ensure_fresh().await.unwrap();
-        assert_eq!(m.bearer().await.unwrap(), "Bearer gho_refreshed");
-
-        // Cache file should now reflect the new state.
-        let on_disk = token_cache::load(&cache_path).unwrap().unwrap();
-        assert_eq!(on_disk.access_token, "jwt2.body.sig");
-        assert_eq!(on_disk.refresh_token, "rt-2");
-        assert_eq!(on_disk.github_token.as_deref(), Some("gho_refreshed"));
-    }
-
-    #[tokio::test]
-    async fn refreshable_refresh_denied_surfaces_auth_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/mcp/token"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": "access_denied",
-                "error_description": "refresh token revoked",
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let now = token_cache::now_secs();
-        let cache_path = write_cache(&sample(now + 60));
-        let m = TokenManager::from_cache(
-            cache_path,
-            cfg(server.uri()),
-            Some("shh".into()),
-            reqwest::Client::new(),
-        )
-        .unwrap();
-
+        let path = write_cache(&sample(now + 60));
+        let m = TokenManager::from_cache(path, cfg()).unwrap();
         let err = m.ensure_fresh().await.unwrap_err();
-        assert!(matches!(err, BrokerError::Auth(_)));
+        match err {
+            BrokerError::Auth(s) => assert!(s.contains("re-pair"), "got {s}"),
+            other => panic!("expected Auth(near-expiry), got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -317,14 +222,20 @@ mod tests {
             std::process::id(),
             token_cache::now_secs()
         ));
-        let err = TokenManager::from_cache(
-            bogus,
-            cfg("http://unused".into()),
-            Some("shh".into()),
-            reqwest::Client::new(),
-        )
-        .unwrap_err();
+        let err = TokenManager::from_cache(bogus, cfg()).unwrap_err();
         assert!(matches!(err, BrokerError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn from_cache_incomplete_token_returns_auth_error() {
+        let mut incomplete = sample(token_cache::now_secs() + 3600);
+        incomplete.github_token = None;
+        let cache_path = write_cache(&incomplete);
+        let err = TokenManager::from_cache(cache_path, cfg()).unwrap_err();
+        match err {
+            BrokerError::Auth(s) => assert!(s.contains("missing github_token")),
+            other => panic!("expected Auth(_), got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -338,90 +249,18 @@ mod tests {
             "token leaked in debug: {s}"
         );
 
-        // Refreshable variant.
+        // Cached variant.
         let now = token_cache::now_secs();
         let path = write_cache(&sample(now + 3600));
-        let m = TokenManager::from_cache(
-            path,
-            cfg("http://unused".into()),
-            Some("shh".into()),
-            reqwest::Client::new(),
-        )
-        .unwrap();
+        let m = TokenManager::from_cache(path, cfg()).unwrap();
         let s = format!("{m:?}");
-        assert!(
-            s.contains("Refreshable"),
-            "expected Refreshable in debug, got {s}"
-        );
+        assert!(s.contains("Cached"), "expected Cached in debug, got {s}");
         assert!(!s.contains("gho_initial"), "token leaked in debug: {s}");
-    }
-
-    #[tokio::test]
-    async fn refreshable_inactive_introspect_after_refresh_surfaces_auth_error() {
-        let server = MockServer::start().await;
-        // Refresh succeeds.
-        Mock::given(method("POST"))
-            .and(path("/mcp/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "jwt2.body.sig",
-                "refresh_token": "rt-2",
-                "scope": "mcp.read mcp.write",
-                "expires_in": 3600,
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        // Introspect reports the freshly-refreshed JWT as inactive.
-        Mock::given(method("POST"))
-            .and(path("/mcp/introspect"))
-            .and(header("authorization", "shh"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "active": false,
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let now = token_cache::now_secs();
-        let cache_path = write_cache(&sample(now + 60));
-        let m = TokenManager::from_cache(
-            cache_path,
-            cfg(server.uri()),
-            Some("shh".into()),
-            reqwest::Client::new(),
-        )
-        .unwrap();
-
-        let err = m.ensure_fresh().await.unwrap_err();
-        match err {
-            BrokerError::Auth(s) => assert!(s.contains("introspect returned inactive")),
-            other => panic!("expected Auth(inactive), got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn from_cache_incomplete_token_returns_auth_error() {
-        // Cached set is missing github_token (auth was interrupted
-        // before introspect).
-        let mut incomplete = sample(token_cache::now_secs() + 3600);
-        incomplete.github_token = None;
-        let cache_path = write_cache(&incomplete);
-        let err = TokenManager::from_cache(
-            cache_path,
-            cfg("http://unused".into()),
-            Some("shh".into()),
-            reqwest::Client::new(),
-        )
-        .unwrap_err();
-        match err {
-            BrokerError::Auth(s) => assert!(s.contains("missing github_token")),
-            other => panic!("expected Auth(_), got {other:?}"),
-        }
     }
 
     /// P10 #11: secret material must never appear in `Debug` output.
     /// Both `TokenManager::Static` (PAT / installation token) and the
-    /// `Refreshable` mode (auth-worker JWT) must redact.
+    /// `Cached` mode (auth-worker JWT) must redact.
     #[test]
     fn debug_impl_does_not_leak_static_token() {
         let secret = "ghp_supersecretvalue123456789abc";
