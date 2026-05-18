@@ -10,69 +10,73 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  rust:
-    name: rust (${{ matrix.kind }})
+  # Standard Rust CI (fmt / clippy / cargo test / cargo build --release) via
+  # the shared reusable. The actual check names this exposes (per GitHub's
+  # nested-workflow display) are `ci / ci / rustfmt`, `ci / ci / clippy`,
+  # `ci / ci / cargo test`, `ci / ci / cargo build --release` — i.e. the
+  # caller-job (`ci`) and reusable-job names both show in the UI.
+  #
+  # `main` branch protection still references the pre-reusable matrix-style
+  # names (`rust (fmt)` / `rust (clippy)` / `rust (test)`). Rather than
+  # rename the reusable's jobs (would drift from every other repo using it)
+  # or force an admin UI edit each time, the `compat-*` shim jobs below
+  # re-export the reusable's results under those legacy names so the
+  # existing protection rule is satisfied as-is. Drop them once admin
+  # updates the rule to point at the reusable's current names.
+  #
+  # `upload_artifact: false` because the musl release build is produced by
+  # `release.yml` on tag push; CI doesn't need to attach the native
+  # x86_64-linux-gnu binary as an artifact. The release-build job below
+  # warms the cross-build cache instead.
+  ci:
+    uses: ippoan/ci-workflows/.github/workflows/rust-ci.yml@main
+    with:
+      binary_name: rust-mcp-agent
+      shared_key: cc-relay
+      upload_artifact: false
+      # Workspace cargo: build the actual binary (`agent-cli`) rather than
+      # the default workspace build, matching what `release.yml` and the
+      # `install-mcp.sh` consumer expect under `target/release/`.
+      cargo_build_args: '--locked -p agent-cli'
+
+  # 100% line coverage gate. Lives outside the reusable because the cc-relay
+  # gate is repo-specific (coverage_100.toml + coverage_allowlist.txt) and
+  # would bloat the shared workflow's surface for repos that don't enforce
+  # coverage. Re-uses the workspace cargo cache via a dedicated shared-key.
+  coverage:
+    name: coverage
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - kind: fmt
-          - kind: clippy
-          - kind: test
-          - kind: coverage
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain
 
-      # fmt は cargo build しないので cache 不要。
-      # clippy / test / coverage は別 artifact なので shared-key を matrix kind
-      # で分けて save 衝突を避ける。save は main の push 時のみに絞り、PR は main
-      # の cache を restore する。
       - uses: Swatinem/rust-cache@v2
-        if: matrix.kind != 'fmt'
         with:
-          shared-key: rust-${{ matrix.kind }}
+          shared-key: cc-relay-coverage
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: cargo fmt --check
-        if: matrix.kind == 'fmt'
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        if: matrix.kind == 'clippy'
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: cargo test
-        if: matrix.kind == 'test'
-        run: cargo test --workspace --all-features --no-fail-fast
-
-      # Coverage gate. `cargo-llvm-cov` runs the workspace tests under
-      # `-C instrument-coverage` and emits a per-file table. We then post-
-      # process to assert that every reported file is at 100% line coverage,
-      # ignoring the un-extractable I/O-loop bodies listed in
-      # `scripts/coverage_ignore.txt`.
       - name: Install cargo-llvm-cov
-        if: matrix.kind == 'coverage'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
 
       - name: cargo llvm-cov (workspace) + 100% gate
-        if: matrix.kind == 'coverage'
         run: bash scripts/coverage_gate.sh
 
-  # Release build dry-run: same target / toolchain / strip step as
-  # release.yml, but no artifact upload. Catches breakage on the
-  # `x86_64-unknown-linux-musl` path on every PR so a real `v*.*.*` tag
-  # push won't surface a surprise build failure.
+  # Musl cross-build dry-run. Mirrors release.yml's build matrix so each PR
+  # keeps the `release-x86_64-unknown-linux-musl` cache warm — real `v*.*.*`
+  # tag pushes then build in seconds instead of minutes. No artifact upload
+  # here (release.yml handles that on the tag itself).
   release-build:
     name: release-build (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -90,18 +94,15 @@ jobs:
       - name: Add target ${{ matrix.target }}
         run: rustup target add ${{ matrix.target }}
 
-      # apt-package cache for `musl-tools` — first run installs, every
-      # subsequent run restores in ~1 s.
       - name: Cache musl-tools (apt)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: musl-tools
           version: 1
 
-      # Share the rust-cache id with release.yml so the cache we warm
-      # here is what release.yml pulls on the next `v*.*.*` tag push.
-      # `shared-key:` (not `key:`) is required for the id to be stable
-      # across workflows — `key:` would mix in the per-job hash.
+      # `shared-key:` (not `key:`) so this cache id is stable across
+      # workflows — `release.yml` pulls the same `release-${{ target }}` id
+      # on its tag-triggered build.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.target }}
@@ -116,3 +117,39 @@ jobs:
           strip "$BIN" || true
           echo "::notice::release binary (stripped): $(ls -lh "$BIN" | awk '{print $5}')"
           sha256sum "$BIN"
+
+  # ── Compatibility shims for legacy `main` branch-protection check names ──
+  # These emit check runs under the pre-reusable matrix-style names
+  # (`rust (fmt)` / `rust (clippy)` / `rust (test)`) that `main` branch
+  # protection's `Required status checks` list still references. Each shim
+  # `needs: ci` so it waits for the reusable; if any reusable job fails the
+  # shim is skipped, which branch protection treats as not-satisfied → the
+  # PR stays blocked. Gating is preserved 1:1 with the underlying reusable.
+  #
+  # Delete this whole block once admin updates `main` branch protection to
+  # use the reusable's actual check names (`ci / ci / rustfmt`,
+  # `ci / ci / clippy`, `ci / ci / cargo test`,
+  # `ci / ci / cargo build --release`).
+  # `name:` (not the job id) drives the displayed check-run name that branch
+  # protection matches on. The job ids stay alphanumeric-`_` per workflow
+  # syntax rules.
+  compat-rust-fmt:
+    name: rust (fmt)
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as rustfmt."'
+
+  compat-rust-clippy:
+    name: rust (clippy)
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as clippy."'
+
+  compat-rust-test:
+    name: rust (test)
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as cargo test."'
