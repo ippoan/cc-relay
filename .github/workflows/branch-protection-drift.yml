@@ -1,0 +1,51 @@
+name: branch-protection-drift
+
+# Catches silent drift between .github/branch-protection.yml (declared
+# required checks) and what CI actually produces on main. See the spec
+# file header for the rationale and the drift-check reusable's source
+# (ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml)
+# for the failure-mode taxonomy.
+#
+# `if: github.event_name != 'pull_request'` (bootstrap workaround):
+# the drift-check reusable inspects only the single tip commit of
+# `head_ref` (default: main), and main's tip can be a deploy-only /
+# docs / auto-merge commit that didn't fire ci.yml — in which case
+# every spec entry shows as a phantom even though every PR produces
+# them correctly.
+#
+# `continue-on-error: true` on a reusable workflow caller is not a
+# supported keyword (workflow rejected with a YAML parse failure),
+# so we gate at the `if:` level instead: drift validates on `push` to
+# main, weekly cron, and manual dispatch — but does not block PR
+# merges while the bootstrap mismatch exists. Remove this guard
+# (run on PR too) once the reusable is improved to aggregate check-
+# runs across the most recent N commits.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/branch-protection.yml'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+  schedule:
+    # Weekly Monday sanity check — catches drift introduced by changes
+    # to the upstream reusable workflows (ippoan/ci-workflows) that
+    # rename jobs without a corresponding cc-relay PR touching `paths`.
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+
+jobs:
+  drift:
+    # Bootstrap: skip on PR until the reusable handles single-commit
+    # skip-case false-positives. See file header.
+    if: github.event_name != 'pull_request'
+    uses: ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml@main
+    permissions:
+      contents: read
+      checks: read
