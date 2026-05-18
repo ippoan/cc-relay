@@ -2,7 +2,7 @@
 //!
 //! The runtime "shim" functions that wire arguments into real I/O loops
 //! (`stdio::run` reading real stdin, `relay::run` opening a real
-//! WebSocket, `auth::start_device_authorization` hitting auth.ippoan.org)
+//! WebSocket, `auth::pair_new` hitting auth.ippoan.org)
 //! live in [`runners`]; that file is excluded from the coverage gate
 //! because it has no testable seam — every line is `let x =
 //! Y::new(args)` or `loop_fn(server).await`. The interesting logic
@@ -44,7 +44,7 @@ pub struct Cli {
 pub enum Cmd {
     /// Run the stdio MCP server.
     Stdio(StdioArgs),
-    /// Run the auth-worker device flow and write `~/.cc-relay/token`.
+    /// Run the auth-worker pair flow (#145) and write `~/.cc-relay/token`.
     Auth(AuthArgs),
     /// Outbound WS to the auth-worker MCP relay.
     Relay(RelayArgs),
@@ -114,6 +114,18 @@ pub struct AuthArgs {
     pub introspect_secret: Option<String>,
     #[arg(long)]
     pub token_path: Option<PathBuf>,
+    /// GitHub username the pair URL is bound to. The browser session
+    /// that clicks the pair link must be signed into the same login.
+    /// Required when `--jwt` is not supplied (i.e. when the runner
+    /// drives the pair flow itself).
+    #[arg(long, env = "CC_RELAY_CLAIM_LOGIN")]
+    pub claim_login: Option<String>,
+    /// Pre-provisioned binding JWT. When set, skips the pair flow and
+    /// goes straight to introspect → token-cache save. Useful for
+    /// non-interactive provisioning (CI, systemd-credentials, …).
+    /// Empty string is treated as unset.
+    #[arg(long, env = "CC_RELAY_MCP_JWT")]
+    pub jwt: Option<String>,
 }
 
 /// Parse `owner/repo`. Extracted so the four runners share one impl
@@ -360,9 +372,36 @@ mod tests {
             client_id: "x".into(),
             introspect_secret: Some(String::new()),
             token_path: Some(dir.join("auth-out.json")),
+            claim_login: Some("alice".into()),
+            jwt: None,
         };
         let e = dispatch(Cmd::Auth(args)).await.unwrap_err();
         let s = format!("{e:#}");
-        assert!(s.contains("device_authorization") || s.contains("connect"));
+        // pair_new is the first network hop; expect that or a generic
+        // connection failure surfaced by reqwest.
+        assert!(
+            s.contains("pair_new") || s.contains("connect") || s.contains("start pair flow"),
+            "got: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_auth_errors_when_neither_jwt_nor_claim_login_set() {
+        let dir = std::env::temp_dir().join(format!("ccr-test-auth-noargs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = AuthArgs {
+            base_url: "http://127.0.0.1:1".into(),
+            client_id: "x".into(),
+            introspect_secret: None,
+            token_path: Some(dir.join("auth-out.json")),
+            claim_login: None,
+            jwt: None,
+        };
+        let e = dispatch(Cmd::Auth(args)).await.unwrap_err();
+        let s = format!("{e:#}");
+        assert!(
+            s.contains("claim-login") || s.contains("CC_RELAY_MCP_JWT"),
+            "got: {s}"
+        );
     }
 }

@@ -16,6 +16,12 @@
 //! sandbox cannot reach `auth.ippoan.org` — see
 //! `docs/relay-validation.md`). The resulting file is read-only-mounted
 //! into the sandbox; the broker process only reads it.
+//!
+//! Since auth-worker issue #145, the pair flow no longer mints refresh
+//! tokens; `refresh_token` is therefore optional and absent on freshly
+//! provisioned caches. Legacy device-flow caches with a refresh token
+//! still deserialize but the broker no longer consumes it — when the
+//! JWT expires (24h pair flow TTL), the user is asked to re-pair.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,16 +32,22 @@ use crate::types::{BrokerError, Result};
 
 /// Cached OAuth token bundle.
 ///
-/// `access_token` is the JWT issued by auth-worker. `github_token` is
-/// the raw GitHub OAuth token returned by `/mcp/introspect`; the broker
-/// uses *that* for `api.github.com` calls. The JWT is held only to
-/// re-introspect after a refresh.
+/// `access_token` is the JWT issued by auth-worker (24h TTL via the
+/// pair flow, or whatever TTL the device-flow token endpoint returned
+/// for legacy caches). `github_token` is the raw GitHub OAuth token
+/// returned by `/mcp/introspect`; the broker uses *that* for
+/// `api.github.com` calls. The JWT is held only to re-introspect after
+/// a manual re-auth.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenSet {
-    /// JWT from `POST /mcp/token`.
+    /// JWT from `POST /mcp/token` (legacy device flow) or
+    /// `POST /mcp/pair/<code>` claim (current pair flow).
     pub access_token: String,
     /// Refresh token from `POST /mcp/token` (30d TTL on auth-worker).
-    pub refresh_token: String,
+    /// `None` since #145 — pair flow does not mint refresh tokens.
+    /// Kept as an option so legacy caches still deserialize cleanly.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     /// Scope string as returned by the token endpoint (e.g.
     /// `"mcp.read mcp.write"`).
     #[serde(default)]
@@ -157,7 +169,7 @@ pub fn delete(path: &Path) -> Result<()> {
 /// Current wall-clock as Unix seconds, clamped at 0. Exposed for
 /// other modules in the crate (auth.rs uses it to stamp
 /// `acquired_at` consistently).
-pub(crate) fn now_secs() -> i64 {
+pub fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -171,7 +183,7 @@ mod tests {
     fn sample(expires_at: i64) -> TokenSet {
         TokenSet {
             access_token: "jwt.payload.sig".into(),
-            refresh_token: "rt-1".into(),
+            refresh_token: Some("rt-1".into()),
             scope: "mcp.read mcp.write".into(),
             github_token: None,
             expires_at,

@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use agent_broker::auth::{self, default_scopes, AuthConfig};
+use agent_broker::token_cache::TokenSet;
 use agent_broker::{introspect, token_cache, Broker, CursorStore, GitHubBroker};
 use agent_mcp::channel::run as channel_run;
 use agent_mcp::relay::{RelayConfig, RelayServer};
@@ -109,6 +110,25 @@ pub async fn run_channel_cmd(args: ChannelArgs) -> Result<()> {
         .context("channel loop exited")
 }
 
+/// Provision `~/.cc-relay/token` using the auth-worker 1-click pair
+/// flow (auth-worker #144 / #145).
+///
+/// Device Flow has been retired (#145). The pair flow has a much
+/// better UX:
+///
+/// 1. POST /mcp/pair/new — anonymous, returns a `pair_url`.
+/// 2. Operator opens the URL in a browser. GitHub OAuth runs once.
+/// 3. Auth-worker stores the binding JWT against the pair code, and
+///    pushes it down any WS attached with `Authorization: Bearer
+///    <pair_code>` (used by `github-mcp-server-rs`).
+///
+/// cc-relay is *server-side* automation — it does not hold a WS to
+/// receive the JWT push. Until auth-worker grows a "fetch the bound
+/// JWT for a pair code" endpoint (issue #145 follow-up), the JWT is
+/// supplied out-of-band: either via `--jwt <value>` / env var
+/// `CC_RELAY_MCP_JWT`, or pasted on stdin when neither is set. The
+/// JWT is then introspected to extract the bound `github_token`,
+/// which is what `api.github.com` calls use.
 pub async fn run_auth(args: AuthArgs) -> Result<()> {
     let secret = args.introspect_secret.as_deref().filter(|s| !s.is_empty());
     let token_path = resolve_token_path(args.token_path)?;
@@ -122,43 +142,80 @@ pub async fn run_auth(args: AuthArgs) -> Result<()> {
         .build()
         .context("build reqwest client")?;
 
-    eprintln!(
-        "rust-mcp-agent: starting device flow against {} (client_id={})",
-        cfg.base_url, cfg.client_id,
-    );
-    let device = auth::start_device_authorization(&http, &cfg)
-        .await
-        .context("start device_authorization")?;
+    // Resolve the JWT, either from explicit args / env, or via the pair
+    // flow + stdin handoff.
+    let jwt = if let Some(j) = args.jwt.as_deref().filter(|s| !s.is_empty()) {
+        j.to_string()
+    } else {
+        let claim_login = args
+            .claim_login
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "either --jwt / CC_RELAY_MCP_JWT or --claim-login is required \
+                     (claim-login is the GitHub username the browser session must match)"
+                )
+            })?;
 
-    let url = device
-        .verification_uri_complete
-        .as_deref()
-        .unwrap_or(&device.verification_uri);
-    eprintln!();
-    eprintln!("Open this URL in a browser and approve:");
-    eprintln!("    {url}");
-    if device.verification_uri_complete.is_none() {
-        eprintln!("(enter user code: {})", device.user_code);
-    }
-    eprintln!();
-    eprintln!("Waiting for approval (polling every {}s)…", device.interval);
-
-    let token_set = auth::poll_token(&http, &cfg, &device)
+        eprintln!(
+            "rust-mcp-agent: starting pair flow against {} (client_id={}, claim_login={})",
+            cfg.base_url, cfg.client_id, claim_login,
+        );
+        let pair = auth::pair_new(
+            &http,
+            &cfg,
+            claim_login,
+            Some(concat!("cc-relay/", env!("CARGO_PKG_VERSION"))),
+        )
         .await
-        .context("poll device token")?;
+        .context("start pair flow")?;
 
-    let active = introspect::introspect(&http, &cfg, secret, &token_set.access_token)
+        eprintln!();
+        eprintln!("Open this URL in a browser and approve:");
+        eprintln!("    {}", pair.pair_url);
+        eprintln!();
+        eprintln!(
+            "(pair code expires in {}s; the browser session must be signed into GitHub as {})",
+            pair.expires_in, claim_login,
+        );
+        eprintln!();
+        eprintln!(
+            "After clicking 'Paired ✓', paste the binding JWT here (received by the WS-attached \
+             binary on `/u/{claim_login}/connect`):"
+        );
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("read JWT from stdin")?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("no JWT was pasted on stdin; re-run `rust-mcp-agent auth`");
+        }
+        trimmed.to_string()
+    };
+
+    // Introspect to verify the JWT is good and to extract github_token.
+    let active = introspect::introspect(&http, &cfg, secret, &jwt)
         .await
-        .context("introspect new access token")?
+        .context("introspect provisioned JWT")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "auth-worker returned active=false immediately after issuing the token; \
-                 INTERNAL_SHARED_SECRET may be wrong or the JWT aud mismatched"
+                "auth-worker reports active=false for the provided JWT; \
+                 ensure the pair flow completed and the JWT was not truncated"
             )
         })?;
 
     let github_login = active.github_login.clone();
-    let final_set = token_set.with_github_token(active.github_token);
+    let final_set = TokenSet {
+        access_token: jwt,
+        refresh_token: None,
+        scope: active.scope,
+        github_token: Some(active.github_token),
+        expires_at: active.exp,
+        acquired_at: token_cache::now_secs(),
+    };
     token_cache::save(&token_path, &final_set).context("write token cache")?;
 
     println!(

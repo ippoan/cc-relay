@@ -26,7 +26,7 @@ pub mod token_cache;
 pub mod token_manager;
 pub mod types;
 
-pub use auth::{AuthConfig, DeviceAuthorizationResponse};
+pub use auth::{AuthConfig, PairNewResponse};
 pub use broker::Broker;
 pub use cursor::CursorStore;
 pub use github::GitHubBroker;

@@ -58,7 +58,7 @@ Other major design decisions:
 
 | Subcommand | Transport | Use |
 |---|---|---|
-| `auth` | HTTPS device flow | One-shot login: writes MCP JWT to `~/.cc-relay/token` |
+| `auth` | HTTPS pair flow (1-click, #145) | One-shot login: writes MCP JWT to `~/.cc-relay/token` |
 | `stdio` | stdin/stdout JSON-RPC | Claude Code spawns this as a local MCP server via `.mcp.json` |
 | `relay` | outbound WSS | Hosts the MCP server *behind* the auth-worker so Claude.ai connector can reach it from anywhere |
 | `channel` | stdio + outbound WSS | Like `stdio`, but also receives GitHub webhook events and pushes them as `notifications/claude/channel` (ADR-005) |
