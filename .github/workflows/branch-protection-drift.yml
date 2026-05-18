@@ -1,0 +1,33 @@
+name: branch-protection-drift
+
+# Catches silent drift between .github/branch-protection.yml (declared
+# required checks) and what CI actually produces on main. See the spec
+# file header for the rationale and the drift-check reusable's source
+# (ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml)
+# for the failure-mode taxonomy.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/branch-protection.yml'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+  schedule:
+    # Weekly Monday sanity check — catches drift introduced by changes
+    # to the upstream reusable workflows (ippoan/ci-workflows) that
+    # rename jobs without a corresponding cc-relay PR touching `paths`.
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+
+jobs:
+  drift:
+    uses: ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml@main
+    permissions:
+      contents: read
+      checks: read

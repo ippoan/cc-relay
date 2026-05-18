@@ -19,15 +19,9 @@ jobs:
   # the shared reusable. The actual check names this exposes (per GitHub's
   # nested-workflow display) are `ci / ci / rustfmt`, `ci / ci / clippy`,
   # `ci / ci / cargo test`, `ci / ci / cargo build --release` — i.e. the
-  # caller-job (`ci`) and reusable-job names both show in the UI.
-  #
-  # `main` branch protection still references the pre-reusable matrix-style
-  # names (`rust (fmt)` / `rust (clippy)` / `rust (test)`). Rather than
-  # rename the reusable's jobs (would drift from every other repo using it)
-  # or force an admin UI edit each time, the `compat-*` shim jobs below
-  # re-export the reusable's results under those legacy names so the
-  # existing protection rule is satisfied as-is. Drop them once admin
-  # updates the rule to point at the reusable's current names.
+  # caller-job (`ci`) and reusable-job names both show in the UI. These are
+  # the names declared in `.github/branch-protection.yml` (verified each
+  # run by `.github/workflows/branch-protection-drift.yml`).
   #
   # `upload_artifact: false` because the musl release build is produced by
   # `release.yml` on tag push; CI doesn't need to attach the native
@@ -117,39 +111,3 @@ jobs:
           strip "$BIN" || true
           echo "::notice::release binary (stripped): $(ls -lh "$BIN" | awk '{print $5}')"
           sha256sum "$BIN"
-
-  # ── Compatibility shims for legacy `main` branch-protection check names ──
-  # These emit check runs under the pre-reusable matrix-style names
-  # (`rust (fmt)` / `rust (clippy)` / `rust (test)`) that `main` branch
-  # protection's `Required status checks` list still references. Each shim
-  # `needs: ci` so it waits for the reusable; if any reusable job fails the
-  # shim is skipped, which branch protection treats as not-satisfied → the
-  # PR stays blocked. Gating is preserved 1:1 with the underlying reusable.
-  #
-  # Delete this whole block once admin updates `main` branch protection to
-  # use the reusable's actual check names (`ci / ci / rustfmt`,
-  # `ci / ci / clippy`, `ci / ci / cargo test`,
-  # `ci / ci / cargo build --release`).
-  # `name:` (not the job id) drives the displayed check-run name that branch
-  # protection matches on. The job ids stay alphanumeric-`_` per workflow
-  # syntax rules.
-  compat-rust-fmt:
-    name: rust (fmt)
-    needs: ci
-    runs-on: ubuntu-latest
-    steps:
-      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as rustfmt."'
-
-  compat-rust-clippy:
-    name: rust (clippy)
-    needs: ci
-    runs-on: ubuntu-latest
-    steps:
-      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as clippy."'
-
-  compat-rust-test:
-    name: rust (test)
-    needs: ci
-    runs-on: ubuntu-latest
-    steps:
-      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as cargo test."'
