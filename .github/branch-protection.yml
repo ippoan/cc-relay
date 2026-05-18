@@ -15,19 +15,25 @@
 # "protection rule references a phantom check" failure mode that bit
 # cc-relay PR #62 (the now-removed compat-rust-{fmt,clippy,test} shims).
 #
-# Check name conventions:
-#   - Reusable workflow jobs nest the caller-job name: `<caller-workflow> /
-#     <caller-job-id> / <reusable-job-name>`. The `ci:` job below calls
-#     ippoan/ci-workflows/rust-ci.yml → 4 jobs surface as `ci / ci / <name>`.
-#   - In-workflow jobs: `<caller-workflow> / <job-name>`. `coverage` and
+# Check name conventions (verified empirically against cc-relay's own
+# check-runs API output — do not trust general docs that claim 3-tier
+# `<workflow> / <job-id> / <reusable-job>` nesting):
+#
+#   - Reusable workflow jobs called from a top-level `uses:`-only caller
+#     job surface as 2-tier: `<caller-workflow-name> / <reusable-job-name>`.
+#     The caller-job key collapses because it has no other steps.
+#     The `ci:` job below calls ippoan/ci-workflows/rust-ci.yml → 4 jobs
+#     surface as `ci / rustfmt`, `ci / clippy`, etc. (not `ci / ci / *`).
+#   - In-workflow jobs: `<caller-workflow-name> / <job-name>` if `name:` is
+#     set, else `<caller-workflow-name> / <job-id>`. `coverage` and
 #     `release-build (...)` are direct, so they show as `coverage` and
 #     `release-build (x86_64-unknown-linux-musl)` respectively.
 
 branch: main
 required_checks:
-  - "ci / ci / rustfmt"
-  - "ci / ci / clippy"
-  - "ci / ci / cargo test"
-  - "ci / ci / cargo build --release"
+  - "ci / rustfmt"
+  - "ci / clippy"
+  - "ci / cargo test"
+  - "ci / cargo build --release"
   - "coverage"
   - "release-build (x86_64-unknown-linux-musl)"
