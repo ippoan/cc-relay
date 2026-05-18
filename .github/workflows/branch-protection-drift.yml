@@ -5,6 +5,15 @@ name: branch-protection-drift
 # file header for the rationale and the drift-check reusable's source
 # (ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml)
 # for the failure-mode taxonomy.
+#
+# Currently `continue-on-error: true`: the drift-check reusable inspects
+# only the single tip commit of `head_ref`, and main's tip can be a
+# deploy-only / docs / auto-merge commit that didn't fire ci.yml — in
+# which case every spec entry shows as a phantom even though every PR
+# produces them correctly. The annotation + Job Summary stay visible
+# for operator review until the reusable is improved to aggregate
+# across the most recent N commits (or query workflow_runs by id),
+# at which point this flag can be removed.
 
 on:
   pull_request:
@@ -31,3 +40,24 @@ jobs:
     permissions:
       contents: read
       checks: read
+
+  # Surface the drift reusable's outcome as a separate non-blocking job
+  # so the PR can merge while the bootstrap-time false-positive (see
+  # file header) is being resolved. Once the reusable is upgraded this
+  # whole `drift-advisory` job and `continue-on-error` can be dropped
+  # and `drift` itself can gate merges.
+  drift-advisory:
+    needs: drift
+    if: always()
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Report drift outcome (non-blocking)
+        env:
+          OUTCOME: ${{ needs.drift.result }}
+        run: |
+          set -euo pipefail
+          echo "drift reusable outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "::warning::Branch protection drift check did not succeed (outcome=$OUTCOME). See the `drift` job Summary for details. This is non-blocking until the reusable is upgraded to aggregate across multiple commits."
+          fi
