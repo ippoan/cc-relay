@@ -66,27 +66,32 @@ crates/agent-broker/src/github.rs:327   # dead-defensive-transport
 crates/agent-broker/src/github.rs:1665  # brace-attribution
 
 # --- agent-broker/src/token_cache.rs -------------------------------------
-crates/agent-broker/src/token_cache.rs:75   # platform-conditional: dirs::home_dir() None requires no /etc/passwd entry
-crates/agent-broker/src/token_cache.rs:76   # platform-conditional
-crates/agent-broker/src/token_cache.rs:77   # platform-conditional
-crates/agent-broker/src/token_cache.rs:78   # platform-conditional
-crates/agent-broker/src/token_cache.rs:119  # brace-attribution
-crates/agent-broker/src/token_cache.rs:131  # platform-conditional: chmod 0600 EPERM on file we just created (root never sees this)
-crates/agent-broker/src/token_cache.rs:132  # platform-conditional
-crates/agent-broker/src/token_cache.rs:133  # platform-conditional
-crates/agent-broker/src/token_cache.rs:134  # platform-conditional
-crates/agent-broker/src/token_cache.rs:322  # dead-defensive-test-panic: `other => panic!` arm (BrokerError::Other always matches)
-crates/agent-broker/src/token_cache.rs:334  # dead-defensive-test-panic
-crates/agent-broker/src/token_cache.rs:352  # dead-defensive-test-panic
-crates/agent-broker/src/token_cache.rs:367  # dead-defensive-test-panic
-crates/agent-broker/src/token_cache.rs:385  # dead-defensive-test-panic
+# Note: line numbers shifted by ~+12 after the #145 pair-flow refactor
+# (auth.rs Device Flow → pair flow) added a doc-comment block at the
+# head of the module.
+crates/agent-broker/src/token_cache.rs:87   # platform-conditional: dirs::home_dir() None requires no /etc/passwd entry
+crates/agent-broker/src/token_cache.rs:88   # platform-conditional
+crates/agent-broker/src/token_cache.rs:89   # platform-conditional
+crates/agent-broker/src/token_cache.rs:90   # platform-conditional
+crates/agent-broker/src/token_cache.rs:131  # brace-attribution
+crates/agent-broker/src/token_cache.rs:143  # platform-conditional: chmod 0600 EPERM on file we just created (root never sees this)
+crates/agent-broker/src/token_cache.rs:144  # platform-conditional
+crates/agent-broker/src/token_cache.rs:145  # platform-conditional
+crates/agent-broker/src/token_cache.rs:146  # platform-conditional
+crates/agent-broker/src/token_cache.rs:334  # dead-defensive-test-panic: `other => panic!` arm (BrokerError::Other always matches)
+crates/agent-broker/src/token_cache.rs:346  # dead-defensive-test-panic
+crates/agent-broker/src/token_cache.rs:364  # dead-defensive-test-panic
+crates/agent-broker/src/token_cache.rs:379  # dead-defensive-test-panic
 crates/agent-broker/src/token_cache.rs:397  # dead-defensive-test-panic
+crates/agent-broker/src/token_cache.rs:409  # dead-defensive-test-panic
 
 # --- agent-cli/src/lib.rs ------------------------------------------------
-crates/agent-cli/src/lib.rs:178  # shim-fn-real-io: `pub fn run() { runners::run() }`
-crates/agent-cli/src/lib.rs:179  # shim-fn-real-io
-crates/agent-cli/src/lib.rs:180  # shim-fn-real-io
-crates/agent-cli/src/lib.rs:250  # brace-attribution
+# Note: line numbers shifted by +12 after the #145 pair-flow refactor
+# added `claim_login` + `jwt` fields to `AuthArgs`.
+crates/agent-cli/src/lib.rs:190  # shim-fn-real-io: `pub fn run() { runners::run() }`
+crates/agent-cli/src/lib.rs:191  # shim-fn-real-io
+crates/agent-cli/src/lib.rs:192  # shim-fn-real-io
+crates/agent-cli/src/lib.rs:262  # brace-attribution
 
 # --- agent-mcp/src/channel.rs --------------------------------------------
 # 94-98: `pub async fn run` — wires real stdin / stdout into run_io.
