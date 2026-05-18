@@ -9,11 +9,21 @@
 #   2. A future apply-from-spec reusable (ippoan/ci-workflows) that PUTs the
 #      protection rule via the Branches API, closing the IaC loop.
 #
-# When CI job names change — e.g. moving to a reusable workflow, switching
-# matrix shape, renaming a step — update this list **in the same PR**. The
-# drift check will fail the PR if you forget, surfacing the silent
-# "protection rule references a phantom check" failure mode that bit
-# cc-relay PR #62 (the now-removed compat-rust-{fmt,clippy,test} shims).
+# CURRENT STATE: main branch protection still references the legacy
+# matrix-style names (`rust (fmt)` / `rust (clippy)` / `rust (test)`)
+# emitted by the compat-* shim jobs in ci.yml. The spec below declares
+# the *target* state — the canonical 2-tier reusable names plus coverage
+# and release-build — so once admin updates the protection rule (e.g.
+# via MCP admin endpoint `set_branch_protection`, or `gh api -X PUT`
+# with `administration:write`, or via the UI) drift detection will start
+# passing, and a follow-up PR can drop the compat-* shim block from
+# ci.yml. Sequence:
+#   1. Merge this PR (introduces spec + drift workflow, keeps shim).
+#   2. Admin updates the protection rule to the 6 names below.
+#   3. Run the drift check workflow manually (workflow_dispatch) to
+#      confirm "✅ No drift" against the new state.
+#   4. Follow-up PR deletes the compat-rust-{fmt,clippy,test} jobs from
+#      .github/workflows/ci.yml.
 #
 # Check name conventions (verified empirically against cc-relay's own
 # check-runs API output — do not trust general docs that claim 3-tier
@@ -22,8 +32,8 @@
 #   - Reusable workflow jobs called from a top-level `uses:`-only caller
 #     job surface as 2-tier: `<caller-workflow-name> / <reusable-job-name>`.
 #     The caller-job key collapses because it has no other steps.
-#     The `ci:` job below calls ippoan/ci-workflows/rust-ci.yml → 4 jobs
-#     surface as `ci / rustfmt`, `ci / clippy`, etc. (not `ci / ci / *`).
+#     The `ci:` job calls ippoan/ci-workflows/rust-ci.yml → 4 jobs surface
+#     as `ci / rustfmt`, `ci / clippy`, etc. (not `ci / ci / *`).
 #   - In-workflow jobs: `<caller-workflow-name> / <job-name>` if `name:` is
 #     set, else `<caller-workflow-name> / <job-id>`. `coverage` and
 #     `release-build (...)` are direct, so they show as `coverage` and

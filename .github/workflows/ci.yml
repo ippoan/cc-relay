@@ -16,12 +16,19 @@ permissions:
 
 jobs:
   # Standard Rust CI (fmt / clippy / cargo test / cargo build --release) via
-  # the shared reusable. The actual check names this exposes (per GitHub's
-  # nested-workflow display) are `ci / ci / rustfmt`, `ci / ci / clippy`,
-  # `ci / ci / cargo test`, `ci / ci / cargo build --release` — i.e. the
-  # caller-job (`ci`) and reusable-job names both show in the UI. These are
-  # the names declared in `.github/branch-protection.yml` (verified each
-  # run by `.github/workflows/branch-protection-drift.yml`).
+  # the shared reusable. The actual check names this exposes (per the GitHub
+  # check-runs API, verified empirically on PR #63) are 2-tier:
+  # `ci / rustfmt`, `ci / clippy`, `ci / cargo test`,
+  # `ci / cargo build --release`. These are the names declared in
+  # `.github/branch-protection.yml` (verified by the drift-check workflow).
+  #
+  # `main` branch protection still references the pre-reusable matrix-style
+  # names (`rust (fmt)` / `rust (clippy)` / `rust (test)`). The compat-*
+  # shim jobs below re-export the reusable's results under those legacy
+  # names so the existing protection rule is satisfied as-is. Drop them
+  # once admin updates the rule to point at the reusable's actual names
+  # (e.g. via the new MCP admin endpoint `set_branch_protection`, or via
+  # `gh api -X PUT` with `administration:write`, or via the UI).
   #
   # `upload_artifact: false` because the musl release build is produced by
   # `release.yml` on tag push; CI doesn't need to attach the native
@@ -111,3 +118,41 @@ jobs:
           strip "$BIN" || true
           echo "::notice::release binary (stripped): $(ls -lh "$BIN" | awk '{print $5}')"
           sha256sum "$BIN"
+
+  # ── Compatibility shims for legacy `main` branch-protection check names ──
+  # These emit check runs under the pre-reusable matrix-style names
+  # (`rust (fmt)` / `rust (clippy)` / `rust (test)`) that `main` branch
+  # protection's `Required status checks` list still references. Each shim
+  # `needs: ci` so it waits for the reusable; if any reusable job fails the
+  # shim is skipped, which branch protection treats as not-satisfied → the
+  # PR stays blocked. Gating is preserved 1:1 with the underlying reusable.
+  #
+  # Delete this whole block in a follow-up PR after admin updates `main`
+  # branch protection to use the reusable's actual check names
+  # (`ci / rustfmt`, `ci / clippy`, `ci / cargo test`,
+  # `ci / cargo build --release`) — also declared in
+  # `.github/branch-protection.yml` for drift detection.
+  #
+  # `name:` (not the job id) drives the displayed check-run name that branch
+  # protection matches on. The job ids stay alphanumeric-`_` per workflow
+  # syntax rules.
+  compat-rust-fmt:
+    name: rust (fmt)
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as rustfmt."'
+
+  compat-rust-clippy:
+    name: rust (clippy)
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as clippy."'
+
+  compat-rust-test:
+    name: rust (test)
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "Pass-through indicator. Real check ran inside the ci/rust-ci.yml reusable as cargo test."'
