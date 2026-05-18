@@ -6,14 +6,20 @@ name: branch-protection-drift
 # (ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml)
 # for the failure-mode taxonomy.
 #
-# Currently `continue-on-error: true`: the drift-check reusable inspects
-# only the single tip commit of `head_ref`, and main's tip can be a
-# deploy-only / docs / auto-merge commit that didn't fire ci.yml — in
-# which case every spec entry shows as a phantom even though every PR
-# produces them correctly. The annotation + Job Summary stay visible
-# for operator review until the reusable is improved to aggregate
-# across the most recent N commits (or query workflow_runs by id),
-# at which point this flag should be removed.
+# `if: github.event_name != 'pull_request'` (bootstrap workaround):
+# the drift-check reusable inspects only the single tip commit of
+# `head_ref` (default: main), and main's tip can be a deploy-only /
+# docs / auto-merge commit that didn't fire ci.yml — in which case
+# every spec entry shows as a phantom even though every PR produces
+# them correctly.
+#
+# `continue-on-error: true` on a reusable workflow caller is not a
+# supported keyword (workflow rejected with a YAML parse failure),
+# so we gate at the `if:` level instead: drift validates on `push` to
+# main, weekly cron, and manual dispatch — but does not block PR
+# merges while the bootstrap mismatch exists. Remove this guard
+# (run on PR too) once the reusable is improved to aggregate check-
+# runs across the most recent N commits.
 
 on:
   pull_request:
@@ -36,8 +42,9 @@ permissions:
 
 jobs:
   drift:
-    # See file header for why this is non-blocking right now.
-    continue-on-error: true
+    # Bootstrap: skip on PR until the reusable handles single-commit
+    # skip-case false-positives. See file header.
+    if: github.event_name != 'pull_request'
     uses: ippoan/ci-workflows/.github/workflows/branch-protection-drift-check.yml@main
     permissions:
       contents: read
