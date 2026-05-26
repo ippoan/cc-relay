@@ -4,7 +4,9 @@ Issue [#33](https://github.com/ippoan/cc-relay/issues/33) proposes that
 cc-relay use [`ippoan/auth-worker`](https://github.com/ippoan/auth-worker)'s
 MCP OAuth Provider (hosted at `auth.ippoan.org`) for end-user GitHub auth,
 following the same pattern as
-[`ippoan/github-mcp-server-rs`](https://github.com/ippoan/github-mcp-server-rs).
+[`ippoan/mcp-relay-rs`](https://github.com/ippoan/mcp-relay-rs/tree/main/binaries/github-mcp-server-rs)
+(formerly `ippoan/github-mcp-server-rs`, now archived and integrated into the
+mcp-relay-rs monorepo).
 
 That design only works if a **Claude Code on Web sandbox** can reach
 `auth.ippoan.org`. The sandbox enforces a static proxy allowlist
