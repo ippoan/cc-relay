@@ -26,7 +26,7 @@ tracing = "0.1"
 # `UnknownIssuer` で fail する。OS trust store を読む native-roots に固定する。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["rt", "macros", "fs", "time", "sync"] }
-dirs = "5"
+dirs = "6"
 
 [dev-dependencies]
 # wiremock spins up an in-process HTTP server that GitHubBroker is pointed
