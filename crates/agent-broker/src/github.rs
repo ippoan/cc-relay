@@ -59,7 +59,7 @@ const BACKOFF_MAX_MS: u64 = 30_000;
 /// blocking the MCP tool call for minutes.
 const RATE_LIMIT_INLINE_SLEEP_CAP_SECS: i64 = 60;
 
-const USER_AGENT_STR: &str = concat!("cc-relay-agent/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT_STR: &str = concat!("cc-relay-agent/", env!("CARGO_PKG_VERSION"));
 
 /// Body schema for the broker Issue. Keep the JSON layout small and
 /// flat — it has to fit comfortably under GitHub's issue body length
