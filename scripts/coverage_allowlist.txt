@@ -63,7 +63,7 @@ crates/agent-broker/src/cursor.rs:181  # platform-conditional: final bail!()
 
 # --- agent-broker/src/github.rs ------------------------------------------
 crates/agent-broker/src/github.rs:327   # dead-defensive-transport
-crates/agent-broker/src/github.rs:1665  # brace-attribution
+crates/agent-broker/src/github.rs:1702  # brace-attribution
 
 # --- agent-broker/src/token_cache.rs -------------------------------------
 # Note: line numbers shifted by ~+12 after the #145 pair-flow refactor
