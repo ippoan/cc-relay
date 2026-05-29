@@ -504,7 +504,9 @@ QV+dJ2Y20CiDS0cMq0hivy5G+YL7brGnWeU1/3Z0oK/2NyjNKm17qY1y2MKSXjKM\n\
 Bk6Gorx5G0NB7WPEOHfwwd4=\n\
 -----END PRIVATE KEY-----\n";
 
-    fn mount_access_tokens(server: &MockServer, resp: ResponseTemplate) -> Mock {
+    /// Build (but do not mount) the `access_tokens` mock; the caller
+    /// mounts it on its own `MockServer`.
+    fn access_tokens_mock(resp: ResponseTemplate) -> Mock {
         Mock::given(method("POST"))
             .and(path("/app/installations/456/access_tokens"))
             .and(header("accept", "application/vnd.github+json"))
@@ -525,13 +527,10 @@ Bk6Gorx5G0NB7WPEOHfwwd4=\n\
     #[tokio::test]
     async fn github_app_mints_and_returns_bearer() {
         let server = MockServer::start().await;
-        mount_access_tokens(
-            &server,
-            ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "token": "ghs_minttest",
-                "expires_at": "2999-01-01T00:00:00Z"
-            })),
-        )
+        access_tokens_mock(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "token": "ghs_minttest",
+            "expires_at": "2999-01-01T00:00:00Z"
+        })))
         // Exactly one mint for the two ensure_fresh() calls below (the
         // second reuses the cached token).
         .expect(1)
@@ -550,12 +549,9 @@ Bk6Gorx5G0NB7WPEOHfwwd4=\n\
     #[tokio::test]
     async fn github_app_http_error_maps_to_auth() {
         let server = MockServer::start().await;
-        mount_access_tokens(
-            &server,
-            ResponseTemplate::new(403).set_body_string("forbidden"),
-        )
-        .mount(&server)
-        .await;
+        access_tokens_mock(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
 
         let m = TokenManager::github_app_with_base_url("123", "456", TEST_RSA_PEM, server.uri())
             .unwrap();
@@ -572,12 +568,9 @@ Bk6Gorx5G0NB7WPEOHfwwd4=\n\
     #[tokio::test]
     async fn github_app_bad_json_maps_to_other() {
         let server = MockServer::start().await;
-        mount_access_tokens(
-            &server,
-            ResponseTemplate::new(201).set_body_string("not json at all"),
-        )
-        .mount(&server)
-        .await;
+        access_tokens_mock(ResponseTemplate::new(201).set_body_string("not json at all"))
+            .mount(&server)
+            .await;
 
         let m = TokenManager::github_app_with_base_url("123", "456", TEST_RSA_PEM, server.uri())
             .unwrap();
@@ -627,8 +620,7 @@ Bk6Gorx5G0NB7WPEOHfwwd4=\n\
     #[tokio::test]
     async fn github_app_debug_does_not_leak_key_or_token() {
         let server = MockServer::start().await;
-        mount_access_tokens(
-            &server,
+        access_tokens_mock(
             ResponseTemplate::new(201)
                 .set_body_json(serde_json::json!({ "token": "ghs_secret_tok" })),
         )
