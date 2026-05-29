@@ -334,6 +334,43 @@ impl GitHubBroker {
         )))
     }
 
+    /// Post a plain comment to an **arbitrary** repo's issue/PR as the
+    /// configured identity. With the GitHub App [`TokenManager`] this is
+    /// `cc-relay-agent[bot]`, so one org-installed broker can ring any
+    /// PR in the org — the `owner`/`repo`/`issue` args override the
+    /// broker's own binding (this call is cross-repo by design).
+    ///
+    /// This is the **re-wake bell** (Refs #69): a comment whose author is
+    /// a different GitHub login than a watching session passes the
+    /// harness self-loop filter and wakes that session. No deliberate CI
+    /// failure is needed — the distinct identity alone delivers the wake.
+    pub async fn post_wake_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue: u64,
+        body: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/comments",
+            self.base_url, owner, repo, issue
+        );
+        let resp = self
+            .send_with_retry(|| self.http.post(&url).json(&PostCommentReq { body }))
+            .await?;
+
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(BrokerError::Auth("401 on POST wake comment".into()));
+        }
+        if !status.is_success() {
+            return Err(BrokerError::Other(anyhow::anyhow!(
+                "POST wake comment returned {status}"
+            )));
+        }
+        Ok(())
+    }
+
     /// GET the Issue body, parse it as [`Snapshot`], also return the
     /// `ETag` header so callers can pass it back in `If-Match` on the
     /// next PATCH for CAS.
@@ -2099,6 +2136,60 @@ mod tests {
                     "unexpected: {s}"
                 );
             }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    // ---------- post_wake_comment (cross-repo re-wake bell, #69) ----------
+
+    #[tokio::test]
+    async fn post_wake_comment_targets_arbitrary_repo() {
+        let server = MockServer::start().await;
+        // Note the path: a DIFFERENT owner/repo/issue than the broker's own
+        // binding (owner/repo/42) — proves the call is cross-repo.
+        Mock::given(method("POST"))
+            .and(path("/repos/other-owner/other-repo/issues/7/comments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        b.post_wake_comment("other-owner", "other-repo", 7, "📨 wake: ping")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_wake_comment_401_surfaces_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/9/comments"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.post_wake_comment("o", "r", 9, "hi").await.unwrap_err();
+        match err {
+            BrokerError::Auth(s) => assert!(s.contains("401 on POST wake comment"), "got {s}"),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_wake_comment_non_success_surfaces_other() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/9/comments"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let b = fresh_broker(&server, "alice").await;
+        let err = b.post_wake_comment("o", "r", 9, "hi").await.unwrap_err();
+        match err {
+            BrokerError::Other(e) => assert!(e.to_string().contains("404"), "got {e}"),
             other => panic!("expected Other, got {other:?}"),
         }
     }

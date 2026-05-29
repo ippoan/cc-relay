@@ -17,7 +17,7 @@ the canonical record of its non-secret identifiers.
 | Owner            | `ippoan` (organization)                                                |
 | Settings page    | https://github.com/organizations/ippoan/settings/apps/cc-relay-agent   |
 | Public install   | No — `Only on this account`                                            |
-| Installation     | `cc-relay` repo only                                                   |
+| Installation     | **All repositories** (org-wide). Lets the broker ring (comment on) any org repo's PR for cross-repo re-wake (#69) without per-repo install or workflow distribution. |
 | Installation ID  | `132248860`                                                            |
 | Webhook          | Inactive (broker polls; webhook will be enabled when a receiver exists) |
 
