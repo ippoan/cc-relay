@@ -210,6 +210,7 @@ can be set via `.mcp.json` `env`.
 | Tools list empty in Claude Code | Make sure `.mcp.json` is at the repo root *or* in `~/.config/claude-code/`. CCoW reads it on session start (`SessionStart` hook is too late per [hooks docs](https://code.claude.com/docs/en/hooks.md)) |
 | `get_inbox` returns the same message twice | Cursor file (`~/.cc-relay/state-*.json`) was wiped or relocated. Re-run the binary so it recreates the cursor at `Cursor::beginning()` |
 | `subscribe_issue_activity` accepted but no events | Repo webhook is not configured to point at `auth-worker`. See `docs/relay-validation.md` for the one-time setup |
+| stdio binary を更新したのに反映されない | 既定では次セッションで自動反映。走行中セッションへ即反映するなら `kill` + `/mcp` Reconnect（`kill` 単独では stdio は再 spawn しない）。詳細は [`docs/stdio-deployment.md`](./docs/stdio-deployment.md) §4 |
 
 ## Architecture index
 
@@ -219,6 +220,9 @@ can be set via `.mcp.json` `env`.
   GitHub App configuration
 - [`docs/credentials.md`](./docs/credentials.md) — token flows (end-user
   vs maintainer)
+- [`docs/stdio-deployment.md`](./docs/stdio-deployment.md) — CCoW stdio
+  variant deployment (Releases binary / OAT auth / `.claude.json` / kill
+  reflow). Proposal #72 / ADR-008 候補
 - [`docs/sub-agent-workflow.md`](./docs/sub-agent-workflow.md) —
   dogfooding pattern: parallel Claude Code sessions via `Agent` tool
   while broker is being built
