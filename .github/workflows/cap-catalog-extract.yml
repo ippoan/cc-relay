@@ -1,0 +1,13 @@
+name: cap-catalog extract
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  extract:
+    uses: ippoan/ci-workflows/.github/workflows/catalog-extract.yml@main
+    with:
+      language: rust
