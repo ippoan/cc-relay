@@ -36,7 +36,7 @@ jobs:
           - target: x86_64-unknown-linux-musl
             artifact: rust-mcp-agent-x86_64-linux-musl
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain
