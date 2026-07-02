@@ -24,7 +24,7 @@ tracing = "0.1"
 # installation access token. `cc-relay-agent[bot]` identity が wake-trigger
 # comment を打つために必要 (end-user identity だと harness の self-filter で
 # 弾かれる)。
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # `rustls-tls-native-roots` ではなく `rustls-tls` (= webpki-roots) を使うと、
 # Claude Code on Web sandbox の HTTPS intercepting proxy CA を信頼できず
