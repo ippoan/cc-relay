@@ -31,7 +31,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # reqwest は OS trust store を読む native-roots に固定 (詳細は
 # `crates/agent-broker/Cargo.toml` のコメント参照)。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
-rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "schemars"] }
 
 [dev-dependencies]
 # Broker is `#[async_trait]` so test-double impls also need it.
